@@ -32,10 +32,10 @@ public sealed record CloudSaveFile(string ContainerId, string Id, string Name, l
 }
 
 public sealed record TransferProgress(long BytesTransferred, long? TotalBytes);
-public sealed record ReplacementResult(CloudSaveFile File, bool Verified)
-{
-    public string? BackupPath { get; init; }
-}
+//public sealed record ReplacementResult(CloudSaveFile File, bool Verified)
+//{
+    //public string? BackupPath { get; init; }
+//}
 public sealed record ActivityEntry(DateTimeOffset Time, string Description)
 {
     public string TimeText => Time.LocalDateTime.ToString("g");

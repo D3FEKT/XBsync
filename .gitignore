@@ -6,3 +6,4 @@
 *.userosscache
 *.sln.docstates
 **/checks/
+publish/

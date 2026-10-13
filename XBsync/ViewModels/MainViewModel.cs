@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Reflection;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Microsoft.UI.Xaml;
@@ -6,6 +7,20 @@ using XBsync.Models;
 using XBsync.Services;
 
 namespace XBsync.ViewModels;
+
+public sealed class AppInfo
+{
+    public static string Version { get; } = ResolveVersion();
+
+    private static string ResolveVersion()
+    {
+        var assembly = typeof(AppInfo).Assembly;
+        var informational = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        var value = informational ?? assembly.GetName().Version?.ToString() ?? "1.0.0";
+        var plus = value.IndexOf('+');
+        return plus >= 0 ? value[..plus] : value;
+    }
+}
 
 public sealed partial class MainViewModel(IXboxAuthenticationService authentication, IXboxApiService api,
     ICloudSaveService cloud, IDesktopUiService desktop) : ObservableObject
@@ -38,11 +53,11 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
 
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(Gamertag), nameof(Xuid), nameof(AvatarUri), nameof(ConnectionText), nameof(AuthenticationVisibility))]
-    [NotifyCanExecuteChangedFor(nameof(CopyXuidCommand), nameof(DisconnectCommand), nameof(RefreshSavesCommand), nameof(DownloadSelectedCommand), nameof(UploadReplaceCommand))]
+    [NotifyCanExecuteChangedFor(nameof(CopyXuidCommand), nameof(DisconnectCommand), nameof(RefreshSavesCommand), nameof(DownloadSelectedCommand))]
     public partial XboxProfile? Profile { get; set; }
 
     [ObservableProperty]
-    [NotifyCanExecuteChangedFor(nameof(SignInCommand), nameof(RetrySilentSignInCommand), nameof(RefreshCommand), nameof(RefreshSavesCommand), nameof(DownloadSelectedCommand), nameof(UploadReplaceCommand))]
+    [NotifyCanExecuteChangedFor(nameof(SignInCommand), nameof(RetrySilentSignInCommand), nameof(RefreshCommand), nameof(RefreshSavesCommand), nameof(DownloadSelectedCommand))]
     public partial bool IsBusy { get; set; }
 
     [ObservableProperty]
@@ -50,7 +65,7 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
     public partial bool IsLoadingGames { get; set; }
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(CanSelectFiles))]
-    [NotifyCanExecuteChangedFor(nameof(DownloadSelectedCommand), nameof(UploadReplaceCommand))]
+    [NotifyCanExecuteChangedFor(nameof(DownloadSelectedCommand))]
     public partial bool IsLoadingFiles { get; set; }
     [ObservableProperty] public partial string StatusMessage { get; set; } = "Checking local Xbox sign-in…";
     [ObservableProperty] public partial string ErrorMessage { get; set; } = "";
@@ -73,7 +88,7 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
     public partial int SelectedFileCount { get; set; }
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(TransferVisibility), nameof(CanSelectFiles))]
-    [NotifyCanExecuteChangedFor(nameof(DownloadSelectedCommand), nameof(UploadReplaceCommand), nameof(CancelTransferCommand), nameof(RefreshSavesCommand), nameof(RefreshCommand))]
+    [NotifyCanExecuteChangedFor(nameof(DownloadSelectedCommand), nameof(CancelTransferCommand), nameof(RefreshSavesCommand), nameof(RefreshCommand))]
     public partial bool IsTransferring { get; set; }
     [ObservableProperty] public partial string TransferText { get; set; } = "";
     [ObservableProperty] public partial double TransferPercent { get; set; }
@@ -96,7 +111,7 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
     public Visibility NoGameVisibility => Visible(SelectedGame is null);
     public Visibility TransferVisibility => Visible(IsTransferring);
     public bool CanSelectFiles => !IsLoadingFiles && !IsTransferring;
-    public string SelectionText => SelectedFileCount == 0 ? "Select one or more files to download, or exactly one file to replace."
+    public string SelectionText => SelectedFileCount == 0 ? "Select one or more files to download."
         : $"{SelectedFileCount} file{(SelectedFileCount == 1 ? "" : "s")} selected";
     private static Visibility Visible(bool value) => value ? Visibility.Visible : Visibility.Collapsed;
 
@@ -402,11 +417,10 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         FocusedFile = _selectedFiles.FirstOrDefault();
         OnPropertyChanged(nameof(SelectedFiles));
         DownloadSelectedCommand.NotifyCanExecuteChanged();
-        UploadReplaceCommand.NotifyCanExecuteChanged();
     }
     private bool CanDownload() => !IsBusy && !IsLoadingFiles && !IsTransferring && Profile is not null && SelectedGame is not null &&
         SelectedContainer is not null && _selectedFiles.Count > 0 && _selectedFiles.All(file => Files.Contains(file) && file.ContainerId == SelectedContainer.Id);
-    private bool CanReplace() => CanDownload() && _selectedFiles.Count == 1;
+    //private bool CanReplace() => CanDownload() && _selectedFiles.Count == 1;
 
     [RelayCommand(CanExecute = nameof(CanDownload))]
     private async Task DownloadSelectedAsync()
@@ -466,66 +480,68 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         finally { EndTransfer(request, selection); }
     }
 
-    [RelayCommand(CanExecute = nameof(CanReplace))]
-    private async Task UploadReplaceAsync()
-    {
-        if (!CanReplace() || Profile is not { } user || SelectedGame is not { } game || SelectedContainer is not { } container) return;
-        var storageGame = _resolvedStorageIdentity ?? game;
-        var file = _selectedFiles[0];
-        var generation = _accountGeneration;
-        var selection = _saveGeneration;
-        using var request = BeginTransfer("Choose the replacement file.");
-        var token = request.Token;
-        ReplacementResult? completedResult = null;
-        try
-        {
-            var path = await desktop.ChooseReplacementFileAsync(token);
-            if (!Matches(game, user.Xuid, generation, token) || selection != _saveGeneration) return;
-            if (path is null) { TransferText = "Replacement cancelled before upload."; return; }
-            await using var source = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true);
-            TransferText = $"Confirm replacement of {file.Name}.";
-            if (!await desktop.ConfirmReplacementAsync(file.Name, token)) { TransferText = "Replacement cancelled before upload."; return; }
-            token.ThrowIfCancellationRequested();
-            if (!TransferContextMatches(game, container, user.Xuid, generation, selection)) return;
-            TransferText = $"Backing up and replacing {file.Name}...";
-            var result = await cloud.ReplaceAsync(user.Xuid, storageGame, container, file, source,
-                CreateTransferProgress(request, game, container, user.Xuid, generation, selection, "Replacing", file, 0, 1, source.Length), token);
-            token.ThrowIfCancellationRequested();
-            if (!TransferContextMatches(game, container, user.Xuid, generation, selection)) return;
-            if (!result.Verified)
-            {
-                var backup = string.IsNullOrWhiteSpace(result.BackupPath) ? BackupFolder : result.BackupPath;
-                throw new XboxServiceException($"The replacement could not be verified. Original backup: {backup}.");
-            }
-            completedResult = result;
-            ++_transferProgressGeneration;
-            TransferPercent = 100;
-            TransferText = StatusMessage = $"Replacement verified for {file.Name}. Original backup: {(string.IsNullOrWhiteSpace(result.BackupPath) ? BackupFolder : result.BackupPath)}.";
-            AddActivity(StatusMessage);
-        }
-        catch (OperationCanceledException) when (token.IsCancellationRequested)
-        {
-            if (TransferContextMatches(game, container, user.Xuid, generation, selection))
-            {
-                TransferText = StatusMessage = $"Replacement cancelled. The cloud may have changed; Refresh saves before retrying. Originals backed up before upload remain in {BackupFolder} (%LOCALAPPDATA%/XBsync/Backups).";
-                AddActivity(StatusMessage);
-            }
-        }
-        catch (Exception exception)
-        {
-            if (TransferContextMatches(game, container, user.Xuid, generation, selection))
-            {
-                ReportTransferError(exception, $"Replacement failed or could not be verified. Check the local file is readable and the game is closed, then Refresh saves before retrying. Originals backed up before upload remain in {BackupFolder} (%LOCALAPPDATA%/XBsync/Backups).");
-                TransferText = ErrorMessage;
-                AddActivity(ErrorMessage);
-            }
-        }
-        finally { EndTransfer(request, selection); }
-        if (completedResult is not null && Matches(game, user.Xuid, generation, token) && selection == _saveGeneration)
-            await LoadContainersAsync(game, user.Xuid, generation, container.Id, [completedResult.File.Id]);
-    }
+    // Upload & Replace was removed from the UI. This backend stays disabled until the replace transport is verified.
+    //[RelayCommand(CanExecute = nameof(CanReplace))]
+    //private async Task UploadReplaceAsync()
+    //{
+        //if (!CanReplace() || Profile is not { } user || SelectedGame is not { } game || SelectedContainer is not { } container) return;
+        //var storageGame = _resolvedStorageIdentity ?? game;
+        //var file = _selectedFiles[0];
+        //var generation = _accountGeneration;
+        //var selection = _saveGeneration;
+        //using var request = BeginTransfer("Choose the replacement file.");
+        //var token = request.Token;
+        //ReplacementResult? completedResult = null;
+        //try
+        //{
+            //var path = await desktop.ChooseReplacementFileAsync(token);
+            //if (!Matches(game, user.Xuid, generation, token) || selection != _saveGeneration) return;
+            //if (path is null) { TransferText = "Replacement cancelled before upload."; return; }
+            //await using var source = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true);
+            //TransferText = $"Confirm replacement of {file.Name}.";
+            //if (!await desktop.ConfirmReplacementAsync(file.Name, token)) { TransferText = "Replacement cancelled before upload."; return; }
+            //token.ThrowIfCancellationRequested();
+            //if (!TransferContextMatches(game, container, user.Xuid, generation, selection)) return;
+            //TransferText = $"Backing up and replacing {file.Name}...";
+            //var result = await cloud.ReplaceAsync(user.Xuid, storageGame, container, file, source,
+                //CreateTransferProgress(request, game, container, user.Xuid, generation, selection, "Replacing", file, 0, 1, source.Length), token);
+            //token.ThrowIfCancellationRequested();
+            //if (!TransferContextMatches(game, container, user.Xuid, generation, selection)) return;
+            //if (!result.Verified)
+            //{
+                //var backup = string.IsNullOrWhiteSpace(result.BackupPath) ? BackupFolder : result.BackupPath;
+                //throw new XboxServiceException($"The replacement could not be verified. Original backup: {backup}.");
+            //}
+            //completedResult = result;
+            //++_transferProgressGeneration;
+            //TransferPercent = 100;
+            //TransferText = StatusMessage = $"Replacement verified for {file.Name}. Original backup: {(string.IsNullOrWhiteSpace(result.BackupPath) ? BackupFolder : result.BackupPath)}.";
+            //AddActivity(StatusMessage);
+        //}
+        //catch (OperationCanceledException) when (token.IsCancellationRequested)
+        //{
+            //if (TransferContextMatches(game, container, user.Xuid, generation, selection))
+            //{
+                //TransferText = StatusMessage = $"Replacement cancelled. The cloud may have changed; Refresh saves before retrying. Originals backed up before upload remain in {BackupFolder} (%LOCALAPPDATA%/XBsync/Backups).";
+                //AddActivity(StatusMessage);
+            //}
+        //}
+        //catch (Exception exception)
+        //{
+            //if (TransferContextMatches(game, container, user.Xuid, generation, selection))
+            //{
+                //ReportTransferError(exception, $"Replacement failed or could not be verified. Check the local file is readable and the game is closed, then Refresh saves before retrying. Originals backed up before upload remain in {BackupFolder} (%LOCALAPPDATA%/XBsync/Backups).");
+                //TransferText = ErrorMessage;
+                //AddActivity(ErrorMessage);
+            //}
+        //}
+        //finally { EndTransfer(request, selection); }
+        //if (completedResult is not null && Matches(game, user.Xuid, generation, token) && selection == _saveGeneration)
+            //await LoadContainersAsync(game, user.Xuid, generation, container.Id, [completedResult.File.Id]);
+    //}
 
-    private static string BackupFolder => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "XBsync", "Backups");
+    // TODO: unverified, needs further development - only used by the disabled replacement path.
+    //private static string BackupFolder => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "XBsync", "Backups");
 
     private CancellationTokenSource BeginTransfer(string text)
     {
@@ -556,8 +572,8 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         _transferRequest?.Cancel();
         ++_transferProgressGeneration;
         TransferPercent = 0;
-        TransferText = _transferRequest is null ? "" : $"Cancelling the previous transfer. Any originals backed up before upload remain in {BackupFolder} (%LOCALAPPDATA%/XBsync/Backups).";
-        if (wasActive) AddActivity($"Cancelled the previous transfer after changing the game, container, or account. The cloud may have changed; refresh the affected game's saves. Originals backed up before upload remain in {BackupFolder} (%LOCALAPPDATA%/XBsync/Backups).");
+        TransferText = _transferRequest is null ? "" : "Cancelling the previous transfer.";
+        if (wasActive) AddActivity("Cancelled the previous transfer after changing the game, container, or account. The cloud may have changed; refresh the affected game saves.");
         CancelTransferCommand.NotifyCanExecuteChanged();
     }
 
@@ -565,7 +581,7 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
     private void CancelTransfer()
     {
         _transferRequest?.Cancel();
-        TransferText = $"Cancelling transfer... Originals backed up before upload remain in {BackupFolder} (%LOCALAPPDATA%/XBsync/Backups).";
+        TransferText = "Cancelling transfer...";
         CancelTransferCommand.NotifyCanExecuteChanged();
     }
     private bool CanCancelTransfer() => IsTransferring && _transferRequest is { IsCancellationRequested: false };

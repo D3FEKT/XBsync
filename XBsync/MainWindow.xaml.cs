@@ -26,12 +26,9 @@ public sealed partial class MainWindow : Window
         ApplyCaptionTheme(page);
 
         AppWindow.Resize(new SizeInt32(1800, 1200));
-        if (AppWindow.Presenter is OverlappedPresenter presenter &&
-            ApiInformation.IsPropertyPresent("Microsoft.UI.Windowing.OverlappedPresenter", "PreferredMinimumWidth") &&
-            ApiInformation.IsPropertyPresent("Microsoft.UI.Windowing.OverlappedPresenter", "PreferredMinimumHeight"))
+        if (AppWindow.Presenter is OverlappedPresenter presenter)
         {
-            presenter.PreferredMinimumWidth = 900;
-            presenter.PreferredMinimumHeight = 650;
+            TrySetPreferredMinimumSize(presenter, 900, 650);
         }
 
         TrySetIcon();
@@ -59,6 +56,19 @@ public sealed partial class MainWindow : Window
         catch
         {
             // Cosmetic only; never block startup on a missing or unreadable icon.
+        }
+    }
+
+    private static void TrySetPreferredMinimumSize(OverlappedPresenter presenter, int width, int height)
+    {
+        try
+        {
+            presenter.PreferredMinimumWidth = width;
+            presenter.PreferredMinimumHeight = height;
+        }
+        catch
+        {
+            // Older Windows App SDK runtimes lack these properties; ignore.
         }
     }
 

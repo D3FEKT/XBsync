@@ -16,8 +16,8 @@ public interface IDesktopUiService
     Task<AuthenticationResult> WithDeviceCodeDialogAsync(DeviceCodePrompt prompt, Func<CancellationToken, Task<AuthenticationResult>> authenticate, CancellationToken cancellationToken);
     void CopyText(string text);
     Task<string?> ChooseDownloadFolderAsync(CancellationToken cancellationToken);
-    Task<string?> ChooseReplacementFileAsync(CancellationToken cancellationToken);
-    Task<bool> ConfirmReplacementAsync(string name, CancellationToken cancellationToken);
+    //Task<string?> ChooseReplacementFileAsync(CancellationToken cancellationToken);
+    //Task<bool> ConfirmReplacementAsync(string name, CancellationToken cancellationToken);
     Task OpenDownloadFolderAsync();
 }
 
@@ -93,47 +93,47 @@ public class DesktopUiService : IDesktopUiService
         return folder.Path;
     }, cancellationToken);
 
-    public Task<string?> ChooseReplacementFileAsync(CancellationToken cancellationToken) => WithModalAsync<string?>(async token =>
-    {
-        var picker = new FileOpenPicker { SuggestedStartLocation = PickerLocationId.Downloads };
-        picker.FileTypeFilter.Add("*");
-        WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(_window!));
-        var operation = picker.PickSingleFileAsync();
-        var file = await AwaitModalOperationAsync(operation, operation.Cancel, token);
-        token.ThrowIfCancellationRequested();
-        if (file is not null && string.IsNullOrWhiteSpace(file.Path))
-            throw new IOException("The selected file must have a local file system path.");
-        return file?.Path;
-    }, cancellationToken);
+    //public Task<string?> ChooseReplacementFileAsync(CancellationToken cancellationToken) => WithModalAsync<string?>(async token =>
+    //{
+        //var picker = new FileOpenPicker { SuggestedStartLocation = PickerLocationId.Downloads };
+        //picker.FileTypeFilter.Add("*");
+        //WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(_window!));
+        //var operation = picker.PickSingleFileAsync();
+        //var file = await AwaitModalOperationAsync(operation, operation.Cancel, token);
+        //token.ThrowIfCancellationRequested();
+        //if (file is not null && string.IsNullOrWhiteSpace(file.Path))
+            //throw new IOException("The selected file must have a local file system path.");
+        //return file?.Path;
+    //}, cancellationToken);
 
-    public Task<bool> ConfirmReplacementAsync(string name, CancellationToken cancellationToken)
-    {
-        ArgumentException.ThrowIfNullOrWhiteSpace(name);
-        return WithModalAsync(async token =>
-        {
-            var closedGame = new CheckBox { Content = "I have closed the game" };
-            var content = new StackPanel { Spacing = 12 };
-            content.Children.Add(new TextBlock
-            {
-                Text = $"Replace the cloud save file \"{name}\" with the selected local file? Close the game first to prevent it from overwriting the replacement. The original is backed up before upload in %LOCALAPPDATA%/XBsync/Backups. The replacement and the other file mappings are checked before success is reported. A cancelled or failed request may still have changed the cloud; keep the backup and refresh before retrying.",
-                TextWrapping = TextWrapping.Wrap
-            });
-            content.Children.Add(closedGame);
-            var dialog = new ContentDialog
-            {
-                XamlRoot = GetXamlRoot(),
-                Title = "Replace cloud save file?",
-                Content = content,
-                PrimaryButtonText = "Replace",
-                IsPrimaryButtonEnabled = false,
-                CloseButtonText = "Cancel",
-                DefaultButton = ContentDialogButton.Close
-            };
-            closedGame.Checked += (_, _) => dialog.IsPrimaryButtonEnabled = true;
-            closedGame.Unchecked += (_, _) => dialog.IsPrimaryButtonEnabled = false;
-            return await ShowDialogAsync(dialog, token) == ContentDialogResult.Primary;
-        }, cancellationToken);
-    }
+    //public Task<bool> ConfirmReplacementAsync(string name, CancellationToken cancellationToken)
+    //{
+        //ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        //return WithModalAsync(async token =>
+        //{
+            //var closedGame = new CheckBox { Content = "I have closed the game" };
+            //var content = new StackPanel { Spacing = 12 };
+            //content.Children.Add(new TextBlock
+            //{
+                //Text = $"Replace the cloud save file \"{name}\" with the selected local file? Close the game first to prevent it from overwriting the replacement. The original is backed up before upload in %LOCALAPPDATA%/XBsync/Backups. The replacement and the other file mappings are checked before success is reported. A cancelled or failed request may still have changed the cloud; keep the backup and refresh before retrying.",
+                //TextWrapping = TextWrapping.Wrap
+            //});
+            //content.Children.Add(closedGame);
+            //var dialog = new ContentDialog
+            //{
+                //XamlRoot = GetXamlRoot(),
+                //Title = "Replace cloud save file?",
+                //Content = content,
+                //PrimaryButtonText = "Replace",
+                //IsPrimaryButtonEnabled = false,
+                //CloseButtonText = "Cancel",
+                //DefaultButton = ContentDialogButton.Close
+            //};
+            //closedGame.Checked += (_, _) => dialog.IsPrimaryButtonEnabled = true;
+            //closedGame.Unchecked += (_, _) => dialog.IsPrimaryButtonEnabled = false;
+            //return await ShowDialogAsync(dialog, token) == ContentDialogResult.Primary;
+        //}, cancellationToken);
+    //}
 
     public Task OpenDownloadFolderAsync() => OnUiAsync(async () =>
     {

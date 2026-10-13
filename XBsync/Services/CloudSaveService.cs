@@ -16,8 +16,9 @@ public interface ICloudSaveService
     Task<IReadOnlyList<CloudSaveFile>> GetFilesAsync(string xuid, GameTitle game, CloudSaveContainer container, CancellationToken cancellationToken);
     Task DownloadAsync(string xuid, GameTitle game, CloudSaveFile file, Stream destination,
         IProgress<TransferProgress>? progress, CancellationToken cancellationToken);
-    Task<ReplacementResult> ReplaceAsync(string xuid, GameTitle game, CloudSaveContainer container,
-        CloudSaveFile file, Stream replacement, IProgress<TransferProgress>? progress, CancellationToken cancellationToken);
+    // TODO: unverified, needs further development - the upload/replace transport stays disabled until it is verified end to end.
+    // Task<ReplacementResult> ReplaceAsync(string xuid, GameTitle game, CloudSaveContainer container,
+    //     CloudSaveFile file, Stream replacement, IProgress<TransferProgress>? progress, CancellationToken cancellationToken);
 }
 
 public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationService authentication) : ICloudSaveService, IDisposable
@@ -78,125 +79,127 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
         await CopyAtomAsync(session, game, atom, destination, file.ETag, progress, cancellationToken).ConfigureAwait(false);
     }
 
-    public async Task<ReplacementResult> ReplaceAsync(string xuid, GameTitle game, CloudSaveContainer container,
-        CloudSaveFile file, Stream replacement, IProgress<TransferProgress>? progress, CancellationToken cancellationToken)
-    {
-        if (!replacement.CanRead || !replacement.CanSeek)
-            throw new XboxServiceException("Choose a readable local file for replacement.");
-        var size = replacement.Length - replacement.Position;
-        if (size < 0 || size > int.MaxValue)
-            throw new XboxServiceException("The connected-storage upload protocol supports replacement files up to 2 GB.");
-        if (file.ContainerId != container.Id) throw Changed();
-        var session = GetSession(xuid, game, cancellationToken);
-        await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        string? backupPath = null;
-        var commitStarted = false;
-        try
-        {
-            var before = await GetSnapshotAsync(session, game, container.Id, cancellationToken).ConfigureAwait(false);
-            var atom = RequireCurrentFile(before, file);
-            var atomId = AtomId(atom);
-            if (before.Atoms.Values.Count(value => AtomId(value) == atomId) != 1)
-                throw new XboxServiceException("This storage atom is shared by multiple files. Replacement is unavailable because it could alter another file.");
-            var originalMetadata = await GetAtomMetadataAsync(session, game, atom, cancellationToken).ConfigureAwait(false);
-            if (file.ETag is not null && file.ETag != originalMetadata.ETag) throw Changed();
-            if (originalMetadata.ETag is null || originalMetadata.ETag.StartsWith("W/", StringComparison.OrdinalIgnoreCase))
-                throw new XboxServiceException("Xbox did not provide a strong file version tag. This file can be downloaded, but replacement is unavailable because concurrent cloud changes could be overwritten. Refresh saves to retry.");
-            await RequireExclusiveAtomAsync(session, game, before, atomId, cancellationToken).ConfigureAwait(false);
-
-            var backupDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "XBsync", "Backups", Guid.NewGuid().ToString("N"));
-            Directory.CreateDirectory(backupDirectory);
-            var originalPath = Path.Combine(backupDirectory, SafeFileName(file.Name));
-            var partialPath = originalPath + ".partial";
-            try
-            {
-                await using (var backup = new FileStream(partialPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
-                    await CopyAtomAsync(session, game, atom, backup, originalMetadata.ETag,
-                        null, cancellationToken).ConfigureAwait(false);
-                File.Move(partialPath, originalPath);
-                backupPath = originalPath;
-            }
-            finally
-            {
-                if (File.Exists(partialPath)) File.Delete(partialPath);
-            }
-
-            var allocationBody = JsonSerializer.Serialize(new { size = (int)size });
-            using var allocation = await RequestJsonAsync(session, game, "atoms/" + atomId, HttpMethod.Post,
-                allocationBody, originalMetadata.ETag, cancellationToken).ConfigureAwait(false);
-            var blobUri = RequireString(allocation.RootElement, "blobUri");
-            var uploadUri = ValidateUploadUri(blobUri);
-            var blocks = new List<string>();
-            var firstBlockId = RandomNumberGenerator.GetInt32(int.MaxValue - 512);
-            var buffer = new byte[BlockSize];
-            var remaining = size;
-            var transferred = 0L;
-            using var uploadedHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-            progress?.Report(new TransferProgress(0, size));
-            while (remaining > 0)
-            {
-                CheckSession(session, cancellationToken);
-                var count = (int)Math.Min(buffer.Length, remaining);
-                await replacement.ReadExactlyAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
-                var blockNumber = new byte[4];
-                BinaryPrimitives.WriteInt32LittleEndian(blockNumber, firstBlockId + blocks.Count);
-                var blockId = Convert.ToBase64String(blockNumber);
-                var blockUri = new Uri(uploadUri.GetLeftPart(UriPartial.Path) + "?comp=block&blockId=" +
-                    Uri.EscapeDataString(blockId) + "&" + uploadUri.Query.TrimStart('?'));
-                using var request = new HttpRequestMessage(HttpMethod.Put, blockUri);
-                request.Headers.Add("x-ms-blob-type", "BlockBlob");
-                request.Content = new ByteArrayContent(buffer, 0, count);
-                using var response = await SendAsync(request, session, cancellationToken).ConfigureAwait(false);
-                uploadedHash.AppendData(buffer, 0, count);
-                blocks.Add(blockId);
-                remaining -= count;
-                transferred += count;
-                progress?.Report(new TransferProgress(transferred, size));
-            }
-            if (replacement.Position != replacement.Length)
-                throw new XboxServiceException("The local replacement file changed while it was being uploaded. Retry with a stable copy.");
-
-            var latest = await GetSnapshotAsync(session, game, container.Id, cancellationToken).ConfigureAwait(false);
-            RequireUnchangedSnapshot(before, latest);
-            await RequireExclusiveAtomAsync(session, game, latest, atomId, cancellationToken).ConfigureAwait(false);
-            var currentMetadata = await GetAtomMetadataAsync(session, game, atom, cancellationToken).ConfigureAwait(false);
-            if (currentMetadata.ETag != originalMetadata.ETag) throw Changed();
-            CheckSession(session, cancellationToken);
-            var commitBody = JsonSerializer.Serialize(new { BlockIds = blocks, Size = (int)size });
-            using (var request = CreateRequest(session, game, "atoms/" + atomId + "?commit=true", HttpMethod.Post,
-                commitBody, currentMetadata.ETag))
-            {
-                commitStarted = true;
-                using var response = await SendAsync(request, session, cancellationToken).ConfigureAwait(false);
-            }
-
-            var actualHash = await CopyAtomAsync(session, game, atom, Stream.Null, null, null, cancellationToken).ConfigureAwait(false);
-            if (!CryptographicOperations.FixedTimeEquals(uploadedHash.GetHashAndReset(), actualHash))
-                throw new XboxServiceException("The committed cloud bytes differ from the uploaded file. The replacement cannot be reported as successful.");
-            var after = await GetSnapshotAsync(session, game, container.Id, cancellationToken).ConfigureAwait(false);
-            if (!SameAtoms(before.Atoms, after.Atoms))
-                throw new XboxServiceException("The container's file references changed during replacement. Refresh and review the save before continuing.");
-            var finalMetadata = await GetAtomMetadataAsync(session, game, atom, cancellationToken).ConfigureAwait(false);
-            CheckSession(session, cancellationToken);
-            return new ReplacementResult(MakeFile(after, file.Id, atom, finalMetadata) with { Size = size }, true)
-                { BackupPath = backupPath };
-        }
-        catch (OperationCanceledException) { throw; }
-        catch (XboxServiceException exception) when (backupPath is not null)
-        {
-            throw new XboxServiceException(exception.Message + (commitStarted ?
-                " The commit may have reached the service; refresh before retrying." : " No file commit was requested.") +
-                " Original backup: " + backupPath, exception.IsPermissionDenied, exception.StatusCode);
-        }
-        catch (Exception exception) when (exception is IOException or HttpRequestException)
-        {
-            throw new XboxServiceException("Replacement could not complete. " + (commitStarted ?
-                "The commit may have reached the service; refresh before retrying. " : "No file commit was requested. ") +
-                (backupPath is null ? "Check your connection and local disk space." : "Original backup: " + backupPath));
-        }
-        finally { _writeGate.Release(); }
-    }
+    // Unverified upload/replace transport: needs further development before it can be re-enabled.
+    // TODO: unverified, needs further development.
+    //public async Task<ReplacementResult> ReplaceAsync(string xuid, GameTitle game, CloudSaveContainer container,
+        //CloudSaveFile file, Stream replacement, IProgress<TransferProgress>? progress, CancellationToken cancellationToken)
+    //{
+        //if (!replacement.CanRead || !replacement.CanSeek)
+            //throw new XboxServiceException("Choose a readable local file for replacement.");
+        //var size = replacement.Length - replacement.Position;
+        //if (size < 0 || size > int.MaxValue)
+            //throw new XboxServiceException("The connected-storage upload protocol supports replacement files up to 2 GB.");
+        //if (file.ContainerId != container.Id) throw Changed();
+        //var session = GetSession(xuid, game, cancellationToken);
+        //await _writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        //string? backupPath = null;
+        //var commitStarted = false;
+        //try
+        //{
+            //var before = await GetSnapshotAsync(session, game, container.Id, cancellationToken).ConfigureAwait(false);
+            //var atom = RequireCurrentFile(before, file);
+            //var atomId = AtomId(atom);
+            //if (before.Atoms.Values.Count(value => AtomId(value) == atomId) != 1)
+                //throw new XboxServiceException("This storage atom is shared by multiple files. Replacement is unavailable because it could alter another file.");
+            //var originalMetadata = await GetAtomMetadataAsync(session, game, atom, cancellationToken).ConfigureAwait(false);
+            //if (file.ETag is not null && file.ETag != originalMetadata.ETag) throw Changed();
+            //if (originalMetadata.ETag is null || originalMetadata.ETag.StartsWith("W/", StringComparison.OrdinalIgnoreCase))
+                //throw new XboxServiceException("Xbox did not provide a strong file version tag. This file can be downloaded, but replacement is unavailable because concurrent cloud changes could be overwritten. Refresh saves to retry.");
+            //await RequireExclusiveAtomAsync(session, game, before, atomId, cancellationToken).ConfigureAwait(false);
+//
+            //var backupDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                //"XBsync", "Backups", Guid.NewGuid().ToString("N"));
+            //Directory.CreateDirectory(backupDirectory);
+            //var originalPath = Path.Combine(backupDirectory, SafeFileName(file.Name));
+            //var partialPath = originalPath + ".partial";
+            //try
+            //{
+                //await using (var backup = new FileStream(partialPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
+                    //await CopyAtomAsync(session, game, atom, backup, originalMetadata.ETag,
+                        //null, cancellationToken).ConfigureAwait(false);
+                //File.Move(partialPath, originalPath);
+                //backupPath = originalPath;
+            //}
+            //finally
+            //{
+                //if (File.Exists(partialPath)) File.Delete(partialPath);
+            //}
+//
+            //var allocationBody = JsonSerializer.Serialize(new { size = (int)size });
+            //using var allocation = await RequestJsonAsync(session, game, "atoms/" + atomId, HttpMethod.Post,
+                //allocationBody, originalMetadata.ETag, cancellationToken).ConfigureAwait(false);
+            //var blobUri = RequireString(allocation.RootElement, "blobUri");
+            //var uploadUri = ValidateUploadUri(blobUri);
+            //var blocks = new List<string>();
+            //var firstBlockId = RandomNumberGenerator.GetInt32(int.MaxValue - 512);
+            //var buffer = new byte[BlockSize];
+            //var remaining = size;
+            //var transferred = 0L;
+            //using var uploadedHash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            //progress?.Report(new TransferProgress(0, size));
+            //while (remaining > 0)
+            //{
+                //CheckSession(session, cancellationToken);
+                //var count = (int)Math.Min(buffer.Length, remaining);
+                //await replacement.ReadExactlyAsync(buffer.AsMemory(0, count), cancellationToken).ConfigureAwait(false);
+                //var blockNumber = new byte[4];
+                //BinaryPrimitives.WriteInt32LittleEndian(blockNumber, firstBlockId + blocks.Count);
+                //var blockId = Convert.ToBase64String(blockNumber);
+                //var blockUri = new Uri(uploadUri.GetLeftPart(UriPartial.Path) + "?comp=block&blockId=" +
+                    //Uri.EscapeDataString(blockId) + "&" + uploadUri.Query.TrimStart('?'));
+                //using var request = new HttpRequestMessage(HttpMethod.Put, blockUri);
+                //request.Headers.Add("x-ms-blob-type", "BlockBlob");
+                //request.Content = new ByteArrayContent(buffer, 0, count);
+                //using var response = await SendAsync(request, session, cancellationToken).ConfigureAwait(false);
+                //uploadedHash.AppendData(buffer, 0, count);
+                //blocks.Add(blockId);
+                //remaining -= count;
+                //transferred += count;
+                //progress?.Report(new TransferProgress(transferred, size));
+            //}
+            //if (replacement.Position != replacement.Length)
+                //throw new XboxServiceException("The local replacement file changed while it was being uploaded. Retry with a stable copy.");
+//
+            //var latest = await GetSnapshotAsync(session, game, container.Id, cancellationToken).ConfigureAwait(false);
+            //RequireUnchangedSnapshot(before, latest);
+            //await RequireExclusiveAtomAsync(session, game, latest, atomId, cancellationToken).ConfigureAwait(false);
+            //var currentMetadata = await GetAtomMetadataAsync(session, game, atom, cancellationToken).ConfigureAwait(false);
+            //if (currentMetadata.ETag != originalMetadata.ETag) throw Changed();
+            //CheckSession(session, cancellationToken);
+            //var commitBody = JsonSerializer.Serialize(new { BlockIds = blocks, Size = (int)size });
+            //using (var request = CreateRequest(session, game, "atoms/" + atomId + "?commit=true", HttpMethod.Post,
+                //commitBody, currentMetadata.ETag))
+            //{
+                //commitStarted = true;
+                //using var response = await SendAsync(request, session, cancellationToken).ConfigureAwait(false);
+            //}
+//
+            //var actualHash = await CopyAtomAsync(session, game, atom, Stream.Null, null, null, cancellationToken).ConfigureAwait(false);
+            //if (!CryptographicOperations.FixedTimeEquals(uploadedHash.GetHashAndReset(), actualHash))
+                //throw new XboxServiceException("The committed cloud bytes differ from the uploaded file. The replacement cannot be reported as successful.");
+            //var after = await GetSnapshotAsync(session, game, container.Id, cancellationToken).ConfigureAwait(false);
+            //if (!SameAtoms(before.Atoms, after.Atoms))
+                //throw new XboxServiceException("The container's file references changed during replacement. Refresh and review the save before continuing.");
+            //var finalMetadata = await GetAtomMetadataAsync(session, game, atom, cancellationToken).ConfigureAwait(false);
+            //CheckSession(session, cancellationToken);
+            //return new ReplacementResult(MakeFile(after, file.Id, atom, finalMetadata) with { Size = size }, true)
+                //{ BackupPath = backupPath };
+        //}
+        //catch (OperationCanceledException) { throw; }
+        //catch (XboxServiceException exception) when (backupPath is not null)
+        //{
+            //throw new XboxServiceException(exception.Message + (commitStarted ?
+                //" The commit may have reached the service; refresh before retrying." : " No file commit was requested.") +
+                //" Original backup: " + backupPath, exception.IsPermissionDenied, exception.StatusCode);
+        //}
+        //catch (Exception exception) when (exception is IOException or HttpRequestException)
+        //{
+            //throw new XboxServiceException("Replacement could not complete. " + (commitStarted ?
+                //"The commit may have reached the service; refresh before retrying. " : "No file commit was requested. ") +
+                //(backupPath is null ? "Check your connection and local disk space." : "Original backup: " + backupPath));
+        //}
+        //finally { _writeGate.Release(); }
+    //}
 
     private async Task<List<BlobMetadata>> GetMetadataAsync(XboxSession session, GameTitle game, CancellationToken cancellationToken)
     {
@@ -256,19 +259,19 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
         return new ContainerSnapshot(metadata, references);
     }
 
-    private async Task RequireExclusiveAtomAsync(XboxSession session, GameTitle game, ContainerSnapshot selected,
-        string atomId, CancellationToken cancellationToken)
-    {
-        var containers = await GetMetadataAsync(session, game, cancellationToken).ConfigureAwait(false);
-        var current = containers.SingleOrDefault(container => container.Path == selected.Metadata.Path) ?? throw Changed();
-        if (current.ETag != selected.Metadata.ETag) throw Changed();
-        foreach (var container in containers.Where(container => container.Path != selected.Metadata.Path))
-        {
-            var snapshot = await GetSnapshotAsync(session, game, container, cancellationToken).ConfigureAwait(false);
-            if (snapshot.Atoms.Values.Any(reference => AtomId(reference) == atomId))
-                throw new XboxServiceException("This storage atom is shared with another save container. Replacement is unavailable because it could alter another save.");
-        }
-    }
+    //private async Task RequireExclusiveAtomAsync(XboxSession session, GameTitle game, ContainerSnapshot selected,
+        //string atomId, CancellationToken cancellationToken)
+    //{
+        //var containers = await GetMetadataAsync(session, game, cancellationToken).ConfigureAwait(false);
+        //var current = containers.SingleOrDefault(container => container.Path == selected.Metadata.Path) ?? throw Changed();
+        //if (current.ETag != selected.Metadata.ETag) throw Changed();
+        //foreach (var container in containers.Where(container => container.Path != selected.Metadata.Path))
+        //{
+            //var snapshot = await GetSnapshotAsync(session, game, container, cancellationToken).ConfigureAwait(false);
+            //if (snapshot.Atoms.Values.Any(reference => AtomId(reference) == atomId))
+                //throw new XboxServiceException("This storage atom is shared with another save container. Replacement is unavailable because it could alter another save.");
+        //}
+    //}
 
     private async Task<AtomMetadata> GetAtomMetadataAsync(XboxSession session, GameTitle game, string atom, CancellationToken cancellationToken)
     {
@@ -395,7 +398,7 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             CheckSession(session, cancellationToken);
-            throw new XboxServiceException("Xbox storage did not respond in time. Refresh before retrying a replacement.");
+            throw new XboxServiceException("Xbox storage did not respond in time. Refresh before retrying.");
         }
         catch (HttpRequestException)
         {
@@ -532,13 +535,13 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
 
     private static string RequireString(JsonElement element, string name) => OptionalString(element, name) ?? throw InvalidResponse();
     private static XboxServiceException InvalidResponse() => new("Xbox storage returned malformed or unsupported save metadata. Refresh and try again.");
-    private static XboxServiceException Changed() => new("The cloud save changed since it was listed. Refresh the files before downloading or replacing.");
+    private static XboxServiceException Changed() => new("The cloud save changed since it was listed. Refresh the files before downloading.");
     private static XboxServiceException HttpFailure(HttpStatusCode status) => status switch
     {
         HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden => new XboxServiceException(
-            $"Xbox denied this storage request (HTTP {(int)status}). Sign in again. If replacement is still denied, this account/client is not permitted to write this game's cloud saves.", true, status),
+            $"Xbox denied this storage request (HTTP {(int)status}). Sign in again. If a write is still denied, this account/client is not permitted to write cloud saves for this game.", true, status),
         HttpStatusCode.PreconditionFailed or HttpStatusCode.Conflict => new XboxServiceException(
-            "Xbox reported a conflicting save update. Close the game and refresh before replacing.", statusCode: status),
+            "Xbox reported a conflicting save update. Close the game and refresh before retrying.", statusCode: status),
         HttpStatusCode.NotFound => new XboxServiceException("The selected cloud container or file no longer exists. Refresh the save list.", statusCode: status),
         HttpStatusCode.TooManyRequests => new XboxServiceException("Xbox storage is throttling requests. Wait briefly before refreshing.", statusCode: status),
         _ => new XboxServiceException($"Xbox storage could not complete the request (HTTP {(int)status}). Refresh and try again later.", statusCode: status)
@@ -549,3 +552,4 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
     private sealed record ContainerSnapshot(BlobMetadata Metadata, Dictionary<string, string> Atoms);
     private sealed record AtomMetadata(long Size, string? ETag, DateTimeOffset? Modified = null);
 }
+

@@ -118,7 +118,7 @@
                     <StackPanel Spacing="10">
                         <FontIcon Glyph="&#xE753;" Foreground="{ThemeResource AccentFillColorDefaultBrush}" HorizontalAlignment="Left" FontSize="28" />
                         <TextBlock Text="Xbox Cloud Saves" FontWeight="SemiBold" />
-                        <TextBlock Text="Browse save containers, download files, and replace an existing save from a local file." TextWrapping="Wrap" FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                        <TextBlock Text="Browse save containers and download files from your Xbox cloud saves." TextWrapping="Wrap" FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                     </StackPanel>
                 </Border>
             </NavigationView.PaneFooter>
@@ -217,10 +217,7 @@
                                             </ComboBox.ItemTemplate>
                                         </ComboBox>
                                         <StackPanel Grid.Row="2" Spacing="8">
-                                            <StackPanel Orientation="Horizontal" Spacing="8">
-                                                <Button Content="Download Selected" Command="{x:Bind ViewModel.DownloadSelectedCommand}" ToolTipService.ToolTip="Select one or more files" />
-                                                <Button Content="Upload &amp; Replace" Command="{x:Bind ViewModel.UploadReplaceCommand}" ToolTipService.ToolTip="Select exactly one existing file" />
-                                            </StackPanel>
+                                            <Button Content="Download Selected" Command="{x:Bind ViewModel.DownloadSelectedCommand}" ToolTipService.ToolTip="Select one or more files" />
                                             <StackPanel Orientation="Horizontal" Spacing="8">
                                                 <Button Content="Refresh saves" Command="{x:Bind ViewModel.RefreshSavesCommand}" />
                                                 <Button Content="Open Download Folder" Command="{x:Bind ViewModel.OpenDownloadFolderCommand}" />
@@ -274,7 +271,7 @@
                             <PivotItem Header="Activity">
                                 <Grid RowSpacing="12">
                                     <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
-                                    <TextBlock Text="XBsync activity for this session, including download destinations and replacement backups." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                    <TextBlock Text="XBsync activity for this session, including download destinations and outcomes." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                     <ListView Grid.Row="1" ItemsSource="{x:Bind ViewModel.Activity}" SelectionMode="None">
                                         <ListView.ItemTemplate><DataTemplate x:DataType="models:ActivityEntry"><StackPanel Padding="4,8" Spacing="5"><TextBlock Text="{x:Bind Description}" TextWrapping="Wrap" /><TextBlock Text="{x:Bind TimeText}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" FontSize="12" /></StackPanel></DataTemplate></ListView.ItemTemplate>
                                     </ListView>
@@ -307,13 +304,13 @@
                             <StackPanel Spacing="10">
                                 <TextBlock Text="Cloud saves" FontSize="18" FontWeight="SemiBold" />
                                 <TextBlock Text="Choose a game and save container, then select one or more files to download. Existing local files are kept; duplicate names receive a numbered suffix." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
-                                <TextBlock Text="To replace a save, close the game and select exactly one existing cloud file. Its original is backed up in %LOCALAPPDATA%\XBsync\Backups before upload. Keep that backup until the replacement works in the game." TextWrapping="Wrap" Foreground="{ThemeResource TextFillColorSecondaryBrush}" IsTextSelectionEnabled="True" />
                             </StackPanel>
                         </Border>
                         <Button Content="Open Download Folder" Command="{x:Bind ViewModel.OpenDownloadFolderCommand}" HorizontalAlignment="Left" />
                         <Border Style="{StaticResource CardStyle}">
                             <StackPanel Spacing="12">
                                 <TextBlock Text="About" FontSize="18" FontWeight="SemiBold" />
+                                <TextBlock x:Name="VersionText" Text="Version 1.0.0" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                 <StackPanel Orientation="Horizontal" Spacing="2" VerticalAlignment="Center">
                                     <TextBlock Text="Created by" VerticalAlignment="Center" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                     <HyperlinkButton Content="D3FEKT" NavigateUri="https://github.com/D3FEKT" Padding="4,0" AutomationProperties.Name="D3FEKT on GitHub" />
