@@ -6,7 +6,7 @@
 
 **Version 1.0.0**
 
-XBsync is a small Windows app for getting at your Xbox cloud saves. It lists what Xbox is holding for a game, downloads the files you want, and saves them to a folder you pick. It's written in C# on .NET 10 with a WinUI 3 interface.
+XBsync is a small Windows app for downloading Xbox cloud saves. It lists what Xbox is holding for a game, downloads the files you want, and saves them to a folder you pick. It's written in C# on .NET 10 with a WinUI 3 interface.
 
 It talks to Xbox's connected-storage service directly and reuses the Xbox sign-in already on your PC where it can, so you usually don't have to type anything in.
 
