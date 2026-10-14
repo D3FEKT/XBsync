@@ -18,7 +18,7 @@ It talks to Xbox's connected-storage service directly and reuses the Xbox sign-i
 - Downloads the files you pick to a folder you choose, with progress, cancel, and safe names when a file already exists.
 - **Download all** pulls every save container for a game in one go, then extracts the folders and files into the folder you pick.
 
-## Downloading
+## Usage
 
 1. Open XBsync and let it try to sign in. Click **Sign in** if it needs a hand.
 2. Pick a game, then one of its save containers.
