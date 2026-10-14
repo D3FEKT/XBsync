@@ -15,9 +15,16 @@ public interface IXboxApiService
 
 public sealed class XboxApiService(HttpClient httpClient, XboxAuthenticationService authentication) : IXboxApiService
 {
-    private const int MaximumResponseBytes = 8 * 1024 * 1024;
+    private const int MaximumResponseBytes = 32 * 1024 * 1024;
     private const int MaximumPages = 50;
     private const int MaximumTitles = 10_000;
+    private const int MaximumAchievementPageSize = 1_000;
+    private const int MaximumAchievementPages = 40;
+    private const int MaximumAchievements = 40_000;
+    private const string HistoryDecoration = "scid";
+    private const int ArtworkConcurrency = 8;
+    private const int ArtworkBudgetSeconds = 90;
+    private const int ThrottleRetries = 2;
 
     public async Task<XboxProfile> GetProfileAsync(string xuid, CancellationToken cancellationToken)
     {
@@ -49,7 +56,17 @@ public sealed class XboxApiService(HttpClient httpClient, XboxAuthenticationServ
     {
         var session = GetSession(cancellationToken);
         var target = RequireXuid(xuid);
-        var firstPage = new Uri($"https://titlehub.xboxlive.com/users/xuid({target})/titles/titlehistory/decoration/scid,image,detail?maxItems={MaximumTitles}");
+        var titles = await GetTitleHistoryAsync(session, target, cancellationToken).ConfigureAwait(false);
+        if (titles.Count == 0)
+            titles = await EnrichTitlesAsync(session, target,
+                await GetAchievementTitlesAsync(session, target, cancellationToken).ConfigureAwait(false), cancellationToken).ConfigureAwait(false);
+        return titles;
+    }
+
+    private async Task<IReadOnlyList<GameTitle>> GetTitleHistoryAsync(XboxSession session, string target,
+        CancellationToken cancellationToken)
+    {
+        var firstPage = new Uri($"https://titlehub.xboxlive.com/users/xuid({target})/titles/titlehistory/decoration/{HistoryDecoration}?maxItems={MaximumTitles}");
         Uri? nextPage = firstPage;
         var visited = new HashSet<string>(StringComparer.Ordinal);
         var titles = new List<GameTitle>();
@@ -105,6 +122,150 @@ public sealed class XboxApiService(HttpClient httpClient, XboxAuthenticationServ
             CheckSession(session, cancellationToken);
             throw new XboxServiceException("Loading the game library timed out. Try again.");
         }
+    }
+
+    private async Task<IReadOnlyList<GameTitle>> GetAchievementTitlesAsync(XboxSession session, string target,
+        CancellationToken cancellationToken)
+    {
+        var firstPage = new Uri($"https://achievements.xboxlive.com/users/xuid({target})/achievements?maxItems={MaximumAchievementPageSize}");
+        Uri? nextPage = firstPage;
+        var visited = new HashSet<string>(StringComparer.Ordinal);
+        var titles = new List<GameTitle>();
+        var identities = new HashSet<(string TitleId, string? Scid)>();
+        var itemCount = 0;
+        using var operation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        operation.CancelAfter(TimeSpan.FromMinutes(2));
+        try
+        {
+            while (nextPage is not null)
+            {
+                CheckSession(session, operation.Token);
+                ValidateEndpoint(nextPage, firstPage);
+                if (visited.Count >= MaximumAchievementPages || !visited.Add(nextPage.AbsoluteUri))
+                    throw new XboxServiceException("Xbox Live returned repeated or excessive achievement pages. Refresh the game library.");
+
+                using var document = await GetJsonAsync(nextPage, session, operation.Token).ConfigureAwait(false);
+                var root = document.RootElement;
+                var achievements = RequireArray(root, "achievements");
+                ValidateResponseAccount(root, target);
+                foreach (var achievement in achievements.EnumerateArray())
+                {
+                    CheckSession(session, operation.Token);
+                    if (++itemCount > MaximumAchievements)
+                        throw new XboxServiceException("Xbox Live returned more achievement history than XBsync can safely load.");
+                    var scid = NormalizeScid(OptionalString(achievement, "serviceConfigId"));
+                    if (!achievement.TryGetProperty("titleAssociations", out var associations) ||
+                        associations.ValueKind != JsonValueKind.Array) continue;
+                    foreach (var association in associations.EnumerateArray())
+                    {
+                        CheckSession(session, operation.Token);
+                        if (association.ValueKind != JsonValueKind.Object) continue;
+                        var titleId = ReadIdentifier(association, "id");
+                        if (!uint.TryParse(titleId, NumberStyles.None, CultureInfo.InvariantCulture, out var id) || id == 0)
+                            throw InvalidResponse();
+                        var name = RequireString(association, "name");
+                        if (identities.Add((titleId, scid)))
+                            titles.Add(new GameTitle(titleId, name, scid, null, ArtworkUri: null, LastPlayed: null, HoursPlayed: null));
+                    }
+                }
+                nextPage = GetAchievementNextPage(root, firstPage);
+            }
+            CheckSession(session, operation.Token);
+            return titles.AsReadOnly();
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            CheckSession(session, cancellationToken);
+            throw new XboxServiceException("Loading the game library timed out. Try again.");
+        }
+    }
+
+    private static Uri? GetAchievementNextPage(JsonElement root, Uri firstPage)
+    {
+        var continuation = (string?)null;
+        if (root.TryGetProperty("pagingInfo", out var paging) && paging.ValueKind == JsonValueKind.Object)
+            continuation = OptionalString(paging, "continuationToken");
+        if (continuation is null) return null;
+        if (continuation.Length > 4096) throw InvalidResponse();
+        var separator = firstPage.Query.Length == 0 ? "?" : "&";
+        return new Uri(firstPage.AbsoluteUri + separator + "continuationToken=" + Uri.EscapeDataString(continuation));
+    }
+
+    private sealed record TitleMetadata(string? Scid, string? Pfn, Uri? Artwork);
+
+    // Achievement history lacks artwork and PFN, so each title is resolved individually from titlehub.
+    private async Task<IReadOnlyList<GameTitle>> EnrichTitlesAsync(XboxSession session, string target,
+        IReadOnlyList<GameTitle> titles, CancellationToken cancellationToken)
+    {
+        var wanted = titles.Where(title => title.ArtworkUri is null || title.PackageFamilyName is null)
+            .Select(title => title.TitleId).Distinct(StringComparer.Ordinal).ToArray();
+        if (wanted.Length == 0) return titles;
+
+        var resolved = new Dictionary<string, TitleMetadata>(StringComparer.Ordinal);
+        using var operation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        operation.CancelAfter(TimeSpan.FromSeconds(ArtworkBudgetSeconds));
+        try
+        {
+            await Parallel.ForEachAsync(wanted,
+                new ParallelOptions { MaxDegreeOfParallelism = ArtworkConcurrency, CancellationToken = operation.Token },
+                async (titleId, token) =>
+                {
+                    TitleMetadata? metadata;
+                    try { metadata = await GetTitleMetadataAsync(session, target, titleId, token).ConfigureAwait(false); }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception) { return; }
+                    if (metadata is not null) lock (resolved) resolved[titleId] = metadata;
+                }).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            CheckSession(session, cancellationToken);
+        }
+        if (resolved.Count == 0) return titles;
+
+        var enriched = new GameTitle[titles.Count];
+        for (var index = 0; index < titles.Count; index++)
+        {
+            var title = titles[index];
+            enriched[index] = resolved.TryGetValue(title.TitleId, out var metadata)
+                ? title with
+                {
+                    ServiceConfigurationId = title.ServiceConfigurationId ?? metadata.Scid,
+                    PackageFamilyName = title.PackageFamilyName ?? metadata.Pfn,
+                    ArtworkUri = title.ArtworkUri ?? metadata.Artwork
+                }
+                : title;
+        }
+        return enriched;
+    }
+
+    private async Task<TitleMetadata?> GetTitleMetadataAsync(XboxSession session, string target, string titleId,
+        CancellationToken cancellationToken)
+    {
+        var uri = new Uri($"https://titlehub.xboxlive.com/users/xuid({target})/titles/titleid({titleId})/decoration/scid,image,detail");
+        JsonDocument document;
+        try
+        {
+            document = await GetJsonAsync(uri, session, cancellationToken).ConfigureAwait(false);
+        }
+        catch (XboxServiceException exception) when (exception.StatusCode == HttpStatusCode.NotFound)
+        {
+            CheckSession(session, cancellationToken);
+            return null;
+        }
+        using (document)
+        {
+            var root = document.RootElement;
+            ValidateResponseAccount(root, target);
+            foreach (var title in RequireArray(root, "titles").EnumerateArray())
+            {
+                CheckSession(session, cancellationToken);
+                if (ReadTitleId(title) != titleId) continue;
+                return new TitleMetadata(NormalizeScid(OptionalString(title, "serviceConfigId")),
+                    NormalizePfn(OptionalString(title, "pfn")), ReadImageUri(OptionalString(title, "displayImage")));
+            }
+        }
+        return null;
     }
 
     public async Task<GameTitle> ResolveStorageIdentityAsync(string xuid, GameTitle game, CancellationToken cancellationToken)
@@ -230,11 +391,12 @@ public sealed class XboxApiService(HttpClient httpClient, XboxAuthenticationServ
             throw new XboxServiceException("The Xbox sign-in expired. Sign in again.", isPermissionDenied: true);
     }
 
-    private async Task<JsonDocument> GetJsonAsync(Uri uri, XboxSession session, CancellationToken cancellationToken)
+    private async Task<JsonDocument> GetJsonAsync(Uri uri, XboxSession session, CancellationToken cancellationToken, int retries = 0)
     {
         CheckSession(session, cancellationToken);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(30));
+        var retryDelay = TimeSpan.Zero;
         try
         {
             using var request = new HttpRequestMessage(HttpMethod.Get, uri);
@@ -246,7 +408,11 @@ public sealed class XboxApiService(HttpClient httpClient, XboxAuthenticationServ
             using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
             CheckSession(session, cancellationToken);
             if (response.RequestMessage?.RequestUri is { } responseUri) ValidateEndpoint(responseUri, uri);
-            if (!response.IsSuccessStatusCode) throw HttpFailure(response.StatusCode);
+            if (!response.IsSuccessStatusCode)
+            {
+                retryDelay = RetryDelay(response);
+                throw HttpFailure(response.StatusCode);
+            }
             if (response.Content.Headers.ContentLength is > MaximumResponseBytes)
                 throw new XboxServiceException("Xbox Live returned a response larger than XBsync can safely load.");
 
@@ -263,6 +429,14 @@ public sealed class XboxApiService(HttpClient httpClient, XboxAuthenticationServ
             }
             CheckSession(session, timeout.Token);
             return JsonDocument.Parse(payload.ToArray(), new JsonDocumentOptions { MaxDepth = 32 });
+        }
+        catch (XboxServiceException exception) when (retries < ThrottleRetries && IsTransient(exception.StatusCode))
+        {
+            CheckSession(session, cancellationToken);
+            await Task.Delay(retryDelay > TimeSpan.Zero ? retryDelay : TimeSpan.FromMilliseconds(500 * (1 << retries)),
+                cancellationToken).ConfigureAwait(false);
+            CheckSession(session, cancellationToken);
+            return await GetJsonAsync(uri, session, cancellationToken, retries + 1).ConfigureAwait(false);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -286,6 +460,22 @@ public sealed class XboxApiService(HttpClient httpClient, XboxAuthenticationServ
             throw new XboxServiceException("The Xbox Live request could not be completed. Try again.");
         }
     }
+
+    private static TimeSpan RetryDelay(HttpResponseMessage response)
+    {
+        var retryAfter = response.Headers.RetryAfter;
+        if (retryAfter?.Delta is { } delta && delta > TimeSpan.Zero && delta <= TimeSpan.FromSeconds(30)) return delta;
+        if (retryAfter?.Date is { } date)
+        {
+            var wait = date - DateTimeOffset.UtcNow;
+            if (wait > TimeSpan.Zero && wait <= TimeSpan.FromSeconds(30)) return wait;
+        }
+        return TimeSpan.Zero;
+    }
+
+    private static bool IsTransient(HttpStatusCode? status) => status is HttpStatusCode.TooManyRequests
+        or HttpStatusCode.InternalServerError or HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable
+        or HttpStatusCode.GatewayTimeout;
 
     private static Uri? GetNextPage(JsonElement root, Uri firstPage)
     {

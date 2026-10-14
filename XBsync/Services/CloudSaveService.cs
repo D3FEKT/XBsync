@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Globalization;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
@@ -21,6 +22,7 @@ public interface ICloudSaveService
     Task<PackedDownloadResult> DownloadPackedAsync(string xuid, GameTitle game, IReadOnlyList<CloudSaveContainer> containers,
         Stream destination, int concurrency, IProgress<TransferProgress>? progress, CancellationToken cancellationToken);
     Task<PackedExtractResult> ExtractPackedAsync(Stream packed, string destinationFolder, CancellationToken cancellationToken);
+    Task<PackedExtractResult> ExtractPackedToZipAsync(Stream packed, ZipArchive archive, CancellationToken cancellationToken);
     Task DownloadAsync(string xuid, GameTitle game, CloudSaveFile file, Stream destination,
         IProgress<TransferProgress>? progress, CancellationToken cancellationToken);
     // TODO: unverified, needs further development - the upload/replace transport stays disabled until it is verified end to end.
@@ -250,6 +252,76 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
             totalBytes += size;
         }
         return new PackedExtractResult(extracted, totalBytes);
+    }
+
+    public async Task<PackedExtractResult> ExtractPackedToZipAsync(Stream packed, ZipArchive archive, CancellationToken cancellationToken)
+    {
+        if (!packed.CanRead) throw new ArgumentException("The packed save must be readable.", nameof(packed));
+        ArgumentNullException.ThrowIfNull(archive);
+        var header = new byte[64 * 1024];
+        var body = new byte[1024 * 1024];
+        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var extracted = 0;
+        var totalBytes = 0L;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var (line, lineLength) = await ReadLineAsync(packed, cancellationToken).ConfigureAwait(false);
+            if (lineLength == 0) break;
+            var fields = line.Split(' ');
+            if (fields.Length != 3 || fields[0] != "XBSYNC1" || fields[1].Length != 64)
+                throw MalformedPack();
+            if (!int.TryParse(fields[2], NumberStyles.None, CultureInfo.InvariantCulture, out var headerLength) ||
+                headerLength <= 0 || headerLength > header.Length)
+                throw MalformedPack();
+            await ReadExactlyAsync(packed, header.AsMemory(0, headerLength), cancellationToken).ConfigureAwait(false);
+            string name;
+            long size;
+            using (var document = JsonDocument.Parse(header.AsMemory(0, headerLength)))
+            {
+                if (!TryProperty(document.RootElement, "name", out var nameElement) || nameElement.ValueKind != JsonValueKind.String ||
+                    !TryProperty(document.RootElement, "size", out var sizeElement) || !sizeElement.TryGetInt64(out size) || size < 0)
+                    throw MalformedPack();
+                name = nameElement.GetString()!;
+            }
+            var expected = BitConverter.ToString(SHA256.HashData(Encoding.UTF8.GetBytes(name))).Replace("-", "");
+            if (!expected.Equals(fields[1], StringComparison.Ordinal)) throw MalformedPack();
+            var entry = archive.CreateEntry(ZipEntryName(name, names), CompressionLevel.Optimal);
+            await using (var destination = entry.Open())
+            {
+                var remaining = size;
+                while (remaining > 0)
+                {
+                    var want = (int)Math.Min(remaining, body.Length);
+                    await ReadExactlyAsync(packed, body.AsMemory(0, want), cancellationToken).ConfigureAwait(false);
+                    await destination.WriteAsync(body.AsMemory(0, want), cancellationToken).ConfigureAwait(false);
+                    remaining -= want;
+                }
+            }
+            extracted++;
+            totalBytes += size;
+        }
+        return new PackedExtractResult(extracted, totalBytes);
+    }
+
+    private static string ZipEntryName(string name, HashSet<string> used)
+    {
+        var segments = name.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length == 0) throw MalformedPack();
+        var parts = new string[segments.Length];
+        for (var index = 0; index < segments.Length; index++)
+        {
+            var segment = segments[index].Trim();
+            if (segment.Length == 0) throw MalformedPack();
+            parts[index] = index == segments.Length - 1 ? SafeFileName(segment) : PackedSafeFolderName(segment);
+        }
+        var candidate = string.Join('/', parts);
+        var directory = parts.Length > 1 ? string.Join('/', parts[..^1]) + "/" : "";
+        var stem = Path.GetFileNameWithoutExtension(parts[^1]);
+        var extension = Path.GetExtension(parts[^1]);
+        for (var suffix = 2; !used.Add(candidate); suffix++)
+            candidate = $"{directory}{stem} ({suffix}){extension}";
+        return candidate;
     }
 
     private static async Task<(string Line, int Length)> ReadLineAsync(Stream packed, CancellationToken token)
@@ -820,7 +892,7 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
     private static XboxServiceException HttpFailure(HttpStatusCode status) => status switch
     {
         HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden => new XboxServiceException(
-            $"Xbox denied this storage request (HTTP {(int)status}). Sign in again. If a write is still denied, this account/client is not permitted to write cloud saves for this game.", true, status),
+            $"Xbox denied this storage request (HTTP {(int)status}). Sign in again, then retry. Xbox grants cloud save access per game and per account, so some titles cannot be opened from another profile.", true, status),
         HttpStatusCode.PreconditionFailed or HttpStatusCode.Conflict => new XboxServiceException(
             "Xbox reported a conflicting save update. Close the game and refresh before retrying.", statusCode: status),
         HttpStatusCode.NotFound => new XboxServiceException("The selected cloud container or file no longer exists. Refresh the save list.", statusCode: status),

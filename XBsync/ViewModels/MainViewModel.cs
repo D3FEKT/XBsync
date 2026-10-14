@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.IO.Compression;
 using System.Globalization;
 using System.Reflection;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -293,7 +294,9 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
                     {
                         _allGames = gamesTask.Result;
                         ApplyGameFilter();
-                        StatusMessage = $"Loaded {_allGames.Count} played games. Choose a game to browse its saves.";
+                        StatusMessage = _allGames.Count == 0
+                            ? "This profile returned no played games. Its game history may be private or hidden."
+                            : $"Loaded {_allGames.Count} played games. Choose a game to browse its saves.";
                         AddActivity($"Loaded {_allGames.Count} played games.");
                     }
                     if (profileTask.IsCompletedSuccessfully || gamesTask.IsCompletedSuccessfully)
@@ -396,7 +399,7 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         {
             if (!Matches(game, xuid, generation, token) || _gameRequest != request) return;
             var storageGame = _resolvedStorageIdentity ?? game;
-            if (!game.HasStorageIdentity && _resolvedStorageIdentity is null)
+            if (_resolvedStorageIdentity is null && NeedsStorageResolution(game))
             {
                 FileStateMessage = "Resolving the selected game's connected-storage identity...";
                 storageGame = await api.ResolveStorageIdentityAsync(xuid, game, token);
@@ -511,19 +514,31 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
     [RelayCommand(CanExecute = nameof(CanDownloadAll))]
     private async Task DownloadPackedAsync()
     {
+        await RunPackedDownloadAsync(false);
+    }
+
+    [RelayCommand(CanExecute = nameof(CanDownloadAll))]
+    private async Task DownloadZipAsync()
+    {
+        await RunPackedDownloadAsync(true);
+    }
+
+    private async Task RunPackedDownloadAsync(bool asZip)
+    {
         if (!CanDownloadAll() || EffectiveXuid is not { } xuid || SelectedGame is not { } game) return;
         var generation = _accountGeneration;
         var selection = _saveGeneration;
-        using var request = BeginTransfer("Choose a download folder.");
+        using var request = BeginTransfer(asZip ? "Choose where to save the ZIP." : "Choose a download folder.");
         var token = request.Token;
         string? folder = null;
         string? pack = null;
+        string? zipPath = null;
         var extracted = 0;
         try
         {
             folder = await desktop.ChooseDownloadFolderAsync(token);
             if (!Matches(game, xuid, generation, token) || selection != _saveGeneration) return;
-            if (folder is null) { TransferText = "Download cancelled before any files were written."; return; }
+            if (folder is null) { TransferText = "Download cancelled before anything was written."; return; }
             folder = Path.GetFullPath(folder);
             var storageGame = await ResolveStorageGameAsync(game, xuid, generation, token);
             if (storageGame is null) return;
@@ -535,23 +550,48 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
                 TransferText = StatusMessage = "No cloud saves were returned for this game.";
                 return;
             }
-            pack = Path.Combine(folder, $".xbsync-{Guid.NewGuid():N}.xbs");
+            var scratch = Path.Combine(Path.GetTempPath(), "XBsync");
+            Directory.CreateDirectory(scratch);
+            pack = Path.Combine(scratch, $".xbsync-{Guid.NewGuid():N}.xbs");
             var result = await DownloadPackedToFileAsync(xuid, storageGame, ordered, pack, request, game, generation, selection, token);
             if (!TransferMatches(game, xuid, generation, selection, token)) return;
             if (result.FileCount == 0)
             {
-                StatusMessage = $"No save files were returned for this game. Nothing was written to {folder}.";
+                StatusMessage = "No save files were returned for this game. Nothing was written.";
                 TransferText = StatusMessage;
                 TransferPercent = 100;
                 AddActivity(StatusMessage);
                 return;
             }
-            TransferText = $"Extracting {result.FileCount} file{(result.FileCount == 1 ? "" : "s")} to {folder}...";
-            await using (var packed = new FileStream(pack, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true))
-                (extracted, _) = await cloud.ExtractPackedAsync(packed, folder, token);
-            if (!TransferMatches(game, xuid, generation, selection, token)) return;
-            TransferPercent = 100;
-            StatusMessage = $"Downloaded and extracted {extracted} file{(extracted == 1 ? "" : "s")} to {folder}.";
+            if (asZip)
+            {
+                var destination = UniqueZipPath(folder, ZipName(game, Profile?.Gamertag));
+                zipPath = destination;
+                TransferText = $"Packing {result.FileCount} file{(result.FileCount == 1 ? "" : "s")} into {Path.GetFileName(destination)}...";
+                await using (var packed = new FileStream(pack, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true))
+                {
+                    await using var file = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true);
+                    using var archive = new ZipArchive(file, ZipArchiveMode.Create);
+                    (extracted, _) = await cloud.ExtractPackedToZipAsync(packed, archive, token);
+                }
+                if (!TransferMatches(game, xuid, generation, selection, token))
+                {
+                    TryDelete(destination);
+                    return;
+                }
+                TransferPercent = 100;
+                var size = new FileInfo(destination).Length;
+                StatusMessage = $"Saved {extracted} file{(extracted == 1 ? "" : "s")} as {Path.GetFileName(destination)} ({SizeText(size)}) in {folder}.";
+            }
+            else
+            {
+                TransferText = $"Extracting {result.FileCount} file{(result.FileCount == 1 ? "" : "s")} to {folder}...";
+                await using (var packed = new FileStream(pack, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true))
+                    (extracted, _) = await cloud.ExtractPackedAsync(packed, folder, token);
+                if (!TransferMatches(game, xuid, generation, selection, token)) return;
+                TransferPercent = 100;
+                StatusMessage = $"Downloaded and extracted {extracted} file{(extracted == 1 ? "" : "s")} to {folder}.";
+            }
             TransferText = StatusMessage;
             AddActivity(StatusMessage);
         }
@@ -559,7 +599,9 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         {
             if (TransferMatches(game, xuid, generation, selection, token))
             {
-                TransferText = StatusMessage = $"Download cancelled. {extracted} file{(extracted == 1 ? "" : "s")} extracted{(folder is null ? "" : $" to {folder}")}; extracted files are kept.";
+                TransferText = StatusMessage = asZip
+                    ? "ZIP download cancelled. No ZIP was saved."
+                    : $"Download cancelled. {extracted} file{(extracted == 1 ? "" : "s")} extracted{(folder is null ? "" : $" to {folder}")}; extracted files are kept.";
                 AddActivity(StatusMessage);
             }
         }
@@ -567,7 +609,10 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         {
             if (TransferMatches(game, xuid, generation, selection, token))
             {
-                var fallback = $"Could not finish packing this game's saves. {extracted} file{(extracted == 1 ? "" : "s")} extracted and kept{(folder is null ? "" : $" in {folder}")}. Check your connection, available disk space, and folder permissions, then retry.";
+                if (zipPath is not null) TryDelete(zipPath);
+                var fallback = asZip
+                    ? "Could not finish the ZIP download. Nothing was saved. Check your connection, available disk space, and folder permissions, then retry."
+                    : $"Could not finish packing this game's saves. {extracted} file{(extracted == 1 ? "" : "s")} extracted and kept{(folder is null ? "" : $" in {folder}")}. Check your connection, available disk space, and folder permissions, then retry.";
                 ReportTransferError(exception, fallback);
                 TransferText = ErrorMessage;
                 AddActivity(ErrorMessage);
@@ -575,14 +620,25 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         }
         finally
         {
-            if (pack is not null)
-            {
-                try { File.Delete(pack); }
-                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
-            }
+            if (pack is not null) TryDelete(pack);
             EndTransfer(request, selection);
         }
     }
+
+    private static void TryDelete(string path)
+    {
+        try { File.Delete(path); }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
+    }
+
+    private static string UniqueZipPath(string folder, string name)
+    {
+        var path = Path.Combine(folder, name + ".zip");
+        for (var suffix = 2; File.Exists(path); suffix++) path = Path.Combine(folder, $"{name} ({suffix}).zip");
+        return path;
+    }
+
+    private static string SizeText(long bytes) => bytes >= 1048576 ? $"{bytes / 1048576d:0.0} MB" : bytes >= 1024 ? $"{bytes / 1024d:0.#} KB" : $"{bytes} B";
 
     private async Task<PackedDownloadResult> DownloadPackedToFileAsync(string xuid, GameTitle game,
         IReadOnlyList<CloudSaveContainer> containers, string path, CancellationTokenSource request, GameTitle selected,
@@ -609,7 +665,7 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
     private async Task<GameTitle?> ResolveStorageGameAsync(GameTitle game, string xuid, int generation, CancellationToken token)
     {
         var storageGame = _resolvedStorageIdentity ?? game;
-        if (!game.HasStorageIdentity && _resolvedStorageIdentity is null)
+        if (_resolvedStorageIdentity is null && NeedsStorageResolution(game))
         {
             TransferText = "Resolving the selected game's connected-storage identity...";
             storageGame = await api.ResolveStorageIdentityAsync(xuid, game, token);
@@ -620,6 +676,17 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         SetError("Xbox Live did not return a valid connected-storage identity for this game. This title may not support Xbox PC cloud saves. Use Refresh saves to retry.");
         TransferText = ErrorMessage;
         return null;
+    }
+
+    private static bool NeedsStorageResolution(GameTitle game) => !game.HasStorageIdentity || game.PackageFamilyName is null;
+
+    private static string ZipName(GameTitle game, string? gamertag)
+    {
+        var owner = string.IsNullOrWhiteSpace(gamertag) || gamertag == "Not connected" ? "XBsync" : gamertag;
+        var safe = string.Concat((owner + " - " + game.Name).Select(character =>
+            Path.GetInvalidFileNameChars().Contains(character) ? '_' : character)).Trim().TrimEnd('.');
+        if (string.IsNullOrWhiteSpace(safe)) safe = "XBsync saves";
+        return safe.Length > 120 ? safe[..120].TrimEnd('.', ' ') : safe;
     }
 
     private bool TransferMatches(GameTitle game, string xuid, int generation, int selection, CancellationToken token) =>

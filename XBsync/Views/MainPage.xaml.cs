@@ -16,7 +16,7 @@ public sealed partial class MainPage : Page
     {
         ViewModel = viewModel;
         InitializeComponent();
-        VersionText.Text = $"Version {AppInfo.Version}";
+        VersionText.Text = $"v{AppInfo.Version}";
         Navigation.SelectedItem = GamesNavigation;
         Unloaded += (_, _) => ViewModel.PropertyChanged -= ViewModel_PropertyChanged;
     }

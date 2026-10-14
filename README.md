@@ -4,7 +4,7 @@
   <img src="docs/icon.png" width="96" alt="XBsync app icon" />
 </p>
 
-**Version 1.0.1**
+**Version 1.0.2**
 
 XBsync is a small Windows app for downloading Xbox cloud saves. It lists what Xbox is holding for a game, downloads the files you want, and saves them to a folder you pick. It's written in C# on .NET 10 with a WinUI 3 interface.
 
