@@ -1,10 +1,12 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 using XBsync.Models;
 
 namespace XBsync.Services;
@@ -14,6 +16,11 @@ public interface ICloudSaveService
     bool IsImplemented { get; }
     Task<IReadOnlyList<CloudSaveContainer>> GetContainersAsync(string xuid, GameTitle game, CancellationToken cancellationToken);
     Task<IReadOnlyList<CloudSaveFile>> GetFilesAsync(string xuid, GameTitle game, CloudSaveContainer container, CancellationToken cancellationToken);
+    Task<CloudSaveBatch> GetAllFilesAsync(string xuid, GameTitle game, IReadOnlyCollection<string> containerIds,
+        IProgress<DownloadAllProgress>? progress, CancellationToken cancellationToken);
+    Task<PackedDownloadResult> DownloadPackedAsync(string xuid, GameTitle game, IReadOnlyList<CloudSaveContainer> containers,
+        Stream destination, int concurrency, IProgress<TransferProgress>? progress, CancellationToken cancellationToken);
+    Task<PackedExtractResult> ExtractPackedAsync(Stream packed, string destinationFolder, CancellationToken cancellationToken);
     Task DownloadAsync(string xuid, GameTitle game, CloudSaveFile file, Stream destination,
         IProgress<TransferProgress>? progress, CancellationToken cancellationToken);
     // TODO: unverified, needs further development - the upload/replace transport stays disabled until it is verified end to end.
@@ -26,6 +33,8 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
     private const int MaximumJsonBytes = 8 * 1024 * 1024;
     private const int BlockSize = 4 * 1024 * 1024;
     private const int MaximumItems = 100_000;
+    private const int ListingConcurrency = 8;
+    private const int MetadataConcurrency = 8;
     private readonly SemaphoreSlim _writeGate = new(1, 1);
     private readonly ECDsa _signingKey = ECDsa.Create(ECCurve.NamedCurves.nistP256);
     public bool IsImplemented => true;
@@ -35,10 +44,10 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
         using var query = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         query.CancelAfter(TimeSpan.FromMinutes(3));
         cancellationToken = query.Token;
-        var session = GetSession(xuid, game, cancellationToken);
+        var target = GetSession(xuid, game, cancellationToken);
         try
         {
-            var blobs = await GetMetadataAsync(session, game, cancellationToken).ConfigureAwait(false);
+            var blobs = await GetMetadataAsync(target, game, cancellationToken).ConfigureAwait(false);
             return blobs.Select(blob => new CloudSaveContainer(blob.Path, blob.DisplayName ?? blob.Path, blob.ETag))
                 .OrderBy(container => container.Name, StringComparer.OrdinalIgnoreCase).ToArray();
         }
@@ -56,27 +65,251 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
         using var query = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         query.CancelAfter(TimeSpan.FromMinutes(3));
         cancellationToken = query.Token;
-        var session = GetSession(xuid, game, cancellationToken);
-        var snapshot = await GetSnapshotAsync(session, game, container.Id, cancellationToken).ConfigureAwait(false);
-        var files = new CloudSaveFile[snapshot.Atoms.Count];
-        await Parallel.ForEachAsync(snapshot.Atoms.Select((pair, index) => (pair, index)),
-            new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = cancellationToken }, async (entry, token) =>
+        var target = GetSession(xuid, game, cancellationToken);
+        var snapshot = await GetSnapshotAsync(target, game, container.Id, cancellationToken).ConfigureAwait(false);
+        // The mapping response carries each atom's name only; size and ETag still need one request per atom.
+        return await BuildFilesAsync(target, game, snapshot, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<CloudSaveBatch> GetAllFilesAsync(string xuid, GameTitle game, IReadOnlyCollection<string> containerIds,
+        IProgress<DownloadAllProgress>? progress, CancellationToken cancellationToken)
+    {
+        using var query = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        query.CancelAfter(TimeSpan.FromMinutes(3));
+        cancellationToken = query.Token;
+        var target = GetSession(xuid, game, cancellationToken);
+        var wanted = containerIds.ToHashSet(StringComparer.Ordinal);
+        if (wanted.Count == 0) return new CloudSaveBatch([], []);
+        var metadata = await GetMetadataAsync(target, game, cancellationToken).ConfigureAwait(false);
+        var selected = metadata.Where(blob => wanted.Contains(blob.Path)).ToArray();
+        var snapshots = new ContainerSnapshot?[selected.Length];
+        var failures = new ContainerReadFailure?[selected.Length];
+        var listed = 0;
+        await Parallel.ForEachAsync(selected.Select((blob, index) => (blob, index)),
+            new ParallelOptions { MaxDegreeOfParallelism = ListingConcurrency, CancellationToken = cancellationToken },
+            async (entry, token) =>
             {
-                var metadata = await GetAtomMetadataAsync(session, game, entry.pair.Value, token).ConfigureAwait(false);
-                files[entry.index] = MakeFile(snapshot, entry.pair.Key, entry.pair.Value, metadata);
+                var name = entry.blob.DisplayName ?? entry.blob.Path;
+                try { snapshots[entry.index] = await GetSnapshotAsync(target, game, entry.blob, token).ConfigureAwait(false); }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception exception)
+                {
+                    failures[entry.index] = new ContainerReadFailure(name,
+                        exception is XboxServiceException service ? service.Message : exception.Message);
+                }
+                progress?.Report(new DownloadAllProgress(Interlocked.Increment(ref listed), selected.Length, name));
             }).ConfigureAwait(false);
-        CheckSession(session, cancellationToken);
-        return files.OrderBy(file => file.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+        var pending = new List<CloudSaveFile>();
+        foreach (var snapshot in snapshots.OfType<ContainerSnapshot>())
+            pending.AddRange(await BuildFilesAsync(target, game, snapshot, cancellationToken).ConfigureAwait(false));
+        CheckSession(target.Session, cancellationToken);
+        return new CloudSaveBatch(pending, [.. failures.OfType<ContainerReadFailure>()]);
     }
 
     public async Task DownloadAsync(string xuid, GameTitle game, CloudSaveFile file, Stream destination,
         IProgress<TransferProgress>? progress, CancellationToken cancellationToken)
     {
         if (!destination.CanWrite) throw new ArgumentException("The download destination must be writable.", nameof(destination));
-        var session = GetSession(xuid, game, cancellationToken);
-        var snapshot = await GetSnapshotAsync(session, game, file.ContainerId, cancellationToken).ConfigureAwait(false);
+        var target = GetSession(xuid, game, cancellationToken);
+        var snapshot = await GetSnapshotAsync(target, game, file.ContainerId, cancellationToken).ConfigureAwait(false);
         var atom = RequireCurrentFile(snapshot, file);
-        await CopyAtomAsync(session, game, atom, destination, file.ETag, progress, cancellationToken).ConfigureAwait(false);
+        await CopyAtomAsync(target, game, atom, destination, file.ETag, progress, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task<PackedDownloadResult> DownloadPackedAsync(string xuid, GameTitle game,
+        IReadOnlyList<CloudSaveContainer> containers, Stream destination, int concurrency,
+        IProgress<TransferProgress>? progress, CancellationToken cancellationToken)
+    {
+        if (!destination.CanWrite) throw new ArgumentException("The download destination must be writable.", nameof(destination));
+        if (concurrency < 1) throw new ArgumentOutOfRangeException(nameof(concurrency));
+        using var query = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        query.CancelAfter(TimeSpan.FromMinutes(30));
+        cancellationToken = query.Token;
+        var target = GetSession(xuid, game, cancellationToken);
+        var ordered = containers.OrderBy(container => container.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+        var metadata = await GetMetadataAsync(target, game, cancellationToken).ConfigureAwait(false);
+        var entries = await PlanEntriesAsync(target, game, metadata, ordered, cancellationToken).ConfigureAwait(false);
+        using var writeGate = new SemaphoreSlim(1, 1);
+        var failures = new ConcurrentQueue<(string Name, Exception Error)>();
+        long transferred = 0;
+        var written = 0;
+        progress?.Report(new TransferProgress(0, -1));
+        var channel = Channel.CreateBounded<PackedEntry>(
+            new BoundedChannelOptions(Math.Max(1, concurrency * 4)) { SingleWriter = true, SingleReader = false });
+        async Task ReadAsync()
+        {
+            await foreach (var item in channel.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                try
+                {
+                    var key = BitConverter.ToString(SHA256.HashData(Encoding.UTF8.GetBytes(item.Path))).Replace("-", "");
+                    var payload = new MemoryStream();
+                    await CopyAtomAsync(target, game, item.Atom, payload, null, null, cancellationToken).ConfigureAwait(false);
+                    if (payload.Length == 0) continue;
+                    var header = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { name = item.Path, size = payload.Length }));
+                    await writeGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+                    try
+                    {
+                        await destination.WriteAsync(Encoding.UTF8.GetBytes("XBSYNC1 " + key + " " + header.Length + "\n"), cancellationToken).ConfigureAwait(false);
+                        await destination.WriteAsync(header, cancellationToken).ConfigureAwait(false);
+                        payload.Position = 0;
+                        await payload.CopyToAsync(destination, cancellationToken).ConfigureAwait(false);
+                    }
+                    finally { writeGate.Release(); }
+                    Interlocked.Increment(ref written);
+                    var done = Interlocked.Add(ref transferred, payload.Length);
+                    progress?.Report(new TransferProgress(done, -1));
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception exception) { failures.Enqueue((item.Name, exception)); }
+            }
+        }
+        var readers = new Task[concurrency];
+        for (var worker = 0; worker < concurrency; worker++) readers[worker] = Task.Run(ReadAsync, cancellationToken);
+        try
+        {
+            foreach (var entry in entries)
+                await channel.Writer.WriteAsync(entry, cancellationToken).ConfigureAwait(false);
+            channel.Writer.Complete();
+            await Task.WhenAll(readers).ConfigureAwait(false);
+            await destination.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            channel.Writer.TryComplete();
+            try { await Task.WhenAll(readers).ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+        }
+        if (failures.TryDequeue(out var failure))
+            throw new XboxServiceException(failure.Error is XboxServiceException service
+                ? service.Message : $"Could not pack {failure.Name}. Check your connection and retry.");
+        cancellationToken.ThrowIfCancellationRequested();
+        CheckSession(target.Session, cancellationToken);
+        return new PackedDownloadResult(written, transferred);
+    }
+
+    public async Task<PackedExtractResult> ExtractPackedAsync(Stream packed, string destinationFolder, CancellationToken cancellationToken)
+    {
+        if (!packed.CanRead) throw new ArgumentException("The packed save must be readable.", nameof(packed));
+        if (string.IsNullOrWhiteSpace(destinationFolder)) throw new ArgumentException("Choose a folder for the extracted saves.", nameof(destinationFolder));
+        var root = Path.GetFullPath(destinationFolder);
+        Directory.CreateDirectory(root);
+        var header = new byte[64 * 1024];
+        var body = new byte[1024 * 1024];
+        var extracted = 0;
+        var totalBytes = 0L;
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var (line, lineLength) = await ReadLineAsync(packed, cancellationToken).ConfigureAwait(false);
+            if (lineLength == 0) break;
+            var fields = line.Split(' ');
+            if (fields.Length != 3 || fields[0] != "XBSYNC1" || fields[1].Length != 64)
+                throw MalformedPack();
+            if (!int.TryParse(fields[2], NumberStyles.None, CultureInfo.InvariantCulture, out var headerLength) ||
+                headerLength <= 0 || headerLength > header.Length)
+                throw MalformedPack();
+            await ReadExactlyAsync(packed, header.AsMemory(0, headerLength), cancellationToken).ConfigureAwait(false);
+            string name;
+            long size;
+            using (var document = JsonDocument.Parse(header.AsMemory(0, headerLength)))
+            {
+                if (!TryProperty(document.RootElement, "name", out var nameElement) || nameElement.ValueKind != JsonValueKind.String ||
+                    !TryProperty(document.RootElement, "size", out var sizeElement) || !sizeElement.TryGetInt64(out size) || size < 0)
+                    throw MalformedPack();
+                name = nameElement.GetString()!;
+            }
+            var expected = BitConverter.ToString(SHA256.HashData(Encoding.UTF8.GetBytes(name))).Replace("-", "");
+            if (!expected.Equals(fields[1], StringComparison.Ordinal)) throw MalformedPack();
+            var path = ExtractPath(root, name);
+            var directory = Path.GetDirectoryName(path)!;
+            Directory.CreateDirectory(directory);
+            var temporary = Path.Combine(directory, $".xbsync-{Guid.NewGuid():N}.partial");
+            try
+            {
+                await using (var file = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true))
+                {
+                    var remaining = size;
+                    while (remaining > 0)
+                    {
+                        var want = (int)Math.Min(remaining, body.Length);
+                        await ReadExactlyAsync(packed, body.AsMemory(0, want), cancellationToken).ConfigureAwait(false);
+                        await file.WriteAsync(body.AsMemory(0, want), cancellationToken).ConfigureAwait(false);
+                        remaining -= want;
+                    }
+                    await file.FlushAsync(cancellationToken).ConfigureAwait(false);
+                }
+                File.Move(temporary, UniquePath(path));
+            }
+            finally
+            {
+                try { if (File.Exists(temporary)) File.Delete(temporary); }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
+            }
+            extracted++;
+            totalBytes += size;
+        }
+        return new PackedExtractResult(extracted, totalBytes);
+    }
+
+    private static async Task<(string Line, int Length)> ReadLineAsync(Stream packed, CancellationToken token)
+    {
+        var buffer = new byte[1];
+        var line = new StringBuilder();
+        while (true)
+        {
+            var read = await packed.ReadAsync(buffer, token).ConfigureAwait(false);
+            if (read == 0)
+            {
+                if (line.Length == 0) return (string.Empty, 0);
+                throw MalformedPack();
+            }
+            if (buffer[0] == (byte)'\n') return (line.ToString(), line.Length + 1);
+            if (line.Length >= 4096) throw MalformedPack();
+            line.Append((char)buffer[0]);
+        }
+    }
+
+    private static async Task ReadExactlyAsync(Stream packed, Memory<byte> destination, CancellationToken token)
+    {
+        var read = 0;
+        while (read < destination.Length)
+        {
+            var count = await packed.ReadAsync(destination[read..], token).ConfigureAwait(false);
+            if (count == 0) throw MalformedPack();
+            read += count;
+        }
+    }
+
+    private static string ExtractPath(string root, string name)
+    {
+        var segments = name.Replace('\\', '/').Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length == 0) throw MalformedPack();
+        var parts = new string[segments.Length];
+        for (var index = 0; index < segments.Length; index++)
+        {
+            var segment = segments[index].Trim();
+            if (segment.Length == 0) throw MalformedPack();
+            parts[index] = index == segments.Length - 1 ? SafeFileName(segment) : PackedSafeFolderName(segment);
+        }
+        var path = Path.GetFullPath(Path.Combine([root, .. parts]));
+        var prefix = root.EndsWith(Path.DirectorySeparatorChar) ? root : root + Path.DirectorySeparatorChar;
+        if (!path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) throw MalformedPack();
+        return path;
+    }
+
+    private static string UniquePath(string path)
+    {
+        if (!File.Exists(path) && !Directory.Exists(path)) return path;
+        var directory = Path.GetDirectoryName(path)!;
+        var stem = Path.GetFileNameWithoutExtension(path);
+        var extension = Path.GetExtension(path);
+        for (var suffix = 2; suffix < 100000; suffix++)
+        {
+            var candidate = Path.Combine(directory, $"{stem} ({suffix}){extension}");
+            if (!File.Exists(candidate) && !Directory.Exists(candidate)) return candidate;
+        }
+        throw MalformedPack();
     }
 
     // Unverified upload/replace transport: needs further development before it can be re-enabled.
@@ -201,7 +434,33 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
         //finally { _writeGate.Release(); }
     //}
 
-    private async Task<List<BlobMetadata>> GetMetadataAsync(XboxSession session, GameTitle game, CancellationToken cancellationToken)
+    private async Task<List<PackedEntry>> PlanEntriesAsync(CloudTarget target, GameTitle game,
+        IReadOnlyList<BlobMetadata> metadata, IReadOnlyList<CloudSaveContainer> containers, CancellationToken cancellationToken)
+    {
+        var groups = new PackedEntry[]?[containers.Count];
+        await Parallel.ForEachAsync(containers.Select((container, index) => (container, index)),
+            new ParallelOptions { MaxDegreeOfParallelism = ListingConcurrency, CancellationToken = cancellationToken },
+            async (item, token) =>
+            {
+                var blob = metadata.SingleOrDefault(entry => entry.Path == item.container.Id) ?? throw Changed();
+                var snapshot = (await GetSnapshotAsync(target, game, blob, token).ConfigureAwait(false)).Atoms;
+                var folder = PackedSafeFolderName(item.container.Name);
+                var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var bucket = new List<PackedEntry>(snapshot.Count);
+                foreach (var pair in snapshot.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase))
+                {
+                    var leaf = SafeFileName(pair.Key);
+                    var stem = Path.GetFileNameWithoutExtension(leaf);
+                    var extension = Path.GetExtension(leaf);
+                    for (var suffix = 2; !used.Add(leaf); suffix++) leaf = $"{stem} ({suffix}){extension}";
+                    bucket.Add(new PackedEntry(folder + "/" + leaf, pair.Value, item.container.Name));
+                }
+                groups[item.index] = [.. bucket];
+            }).ConfigureAwait(false);
+        return [.. groups.SelectMany(group => group ?? [])];
+    }
+
+    private async Task<List<BlobMetadata>> GetMetadataAsync(CloudTarget target, GameTitle game, CancellationToken cancellationToken)
     {
         var blobs = new List<BlobMetadata>();
         var paths = new HashSet<string>(StringComparer.Ordinal);
@@ -210,7 +469,7 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
         do
         {
             var suffix = continuation is null ? "" : "?continuationToken=" + Uri.EscapeDataString(continuation);
-            using var document = await RequestJsonAsync(session, game, suffix, HttpMethod.Get, null, null,
+            using var document = await RequestJsonAsync(target, game, suffix, HttpMethod.Get, null, null,
                 cancellationToken).ConfigureAwait(false);
             var root = document.RootElement;
             if (!TryProperty(root, "blobs", out var entries) || entries.ValueKind != JsonValueKind.Array) throw InvalidResponse();
@@ -229,22 +488,37 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
             if (continuation is not null && (continuation.Length > 4096 || continuations.Count >= 1000 || !continuations.Add(continuation)))
                 throw new XboxServiceException("Xbox storage returned repeated or excessive pages. Refresh the save list.");
         } while (continuation is not null);
-        CheckSession(session, cancellationToken);
+        CheckSession(target.Session, cancellationToken);
         return blobs;
     }
 
-    private async Task<ContainerSnapshot> GetSnapshotAsync(XboxSession session, GameTitle game, string path, CancellationToken cancellationToken)
+    private async Task<ContainerSnapshot> GetSnapshotAsync(CloudTarget target, GameTitle game, string path, CancellationToken cancellationToken)
     {
         ValidatePath(path);
-        var metadata = (await GetMetadataAsync(session, game, cancellationToken).ConfigureAwait(false))
+        var metadata = (await GetMetadataAsync(target, game, cancellationToken).ConfigureAwait(false))
             .SingleOrDefault(item => item.Path == path) ?? throw Changed();
-        return await GetSnapshotAsync(session, game, metadata, cancellationToken).ConfigureAwait(false);
+        return await GetSnapshotAsync(target, game, metadata, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task<ContainerSnapshot> GetSnapshotAsync(XboxSession session, GameTitle game, BlobMetadata metadata,
+    private async Task<IReadOnlyList<CloudSaveFile>> BuildFilesAsync(CloudTarget target, GameTitle game,
+        ContainerSnapshot snapshot, CancellationToken cancellationToken)
+    {
+        var files = new CloudSaveFile[snapshot.Atoms.Count];
+        await Parallel.ForEachAsync(snapshot.Atoms.Select((pair, index) => (pair, index)),
+            new ParallelOptions { MaxDegreeOfParallelism = MetadataConcurrency, CancellationToken = cancellationToken },
+            async (entry, token) =>
+            {
+                var metadata = await GetAtomMetadataAsync(target, game, entry.pair.Value, token).ConfigureAwait(false);
+                files[entry.index] = MakeFile(snapshot, entry.pair.Key, entry.pair.Value, metadata);
+            }).ConfigureAwait(false);
+        CheckSession(target.Session, cancellationToken);
+        return files.OrderBy(file => file.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private async Task<ContainerSnapshot> GetSnapshotAsync(CloudTarget target, GameTitle game, BlobMetadata metadata,
         CancellationToken cancellationToken)
     {
-        using var document = await RequestJsonAsync(session, game, EncodePath(metadata.Path), HttpMethod.Get, null, null,
+        using var document = await RequestJsonAsync(target, game, EncodePath(metadata.Path), HttpMethod.Get, null, null,
             cancellationToken).ConfigureAwait(false);
         if (!TryProperty(document.RootElement, "atoms", out var atoms) || atoms.ValueKind != JsonValueKind.Object) throw InvalidResponse();
         var references = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -255,7 +529,7 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
             _ = AtomId(reference);
             if (references.Count >= MaximumItems || !references.TryAdd(atom.Name, reference)) throw InvalidResponse();
         }
-        CheckSession(session, cancellationToken);
+        CheckSession(target.Session, cancellationToken);
         return new ContainerSnapshot(metadata, references);
     }
 
@@ -273,29 +547,29 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
         //}
     //}
 
-    private async Task<AtomMetadata> GetAtomMetadataAsync(XboxSession session, GameTitle game, string atom, CancellationToken cancellationToken)
+    private async Task<AtomMetadata> GetAtomMetadataAsync(CloudTarget target, GameTitle game, string atom, CancellationToken cancellationToken)
     {
         _ = AtomId(atom);
-        using var request = CreateRequest(session, game, Uri.EscapeDataString(atom), HttpMethod.Head, null, null);
-        using var response = await SendAsync(request, session, cancellationToken, allowUnsupportedHead: true).ConfigureAwait(false);
+        using var request = CreateRequest(target, game, Uri.EscapeDataString(atom), HttpMethod.Head, null, null);
+        using var response = await SendAsync(request, target.Session, cancellationToken, allowUnsupportedHead: true).ConfigureAwait(false);
         if (response.IsSuccessStatusCode && response.Content.Headers.ContentLength is { } size)
             return new AtomMetadata(size, response.Headers.ETag?.ToString(), response.Content.Headers.LastModified);
-        using var fallback = CreateRequest(session, game, Uri.EscapeDataString(atom), HttpMethod.Get, null, null);
+        using var fallback = CreateRequest(target, game, Uri.EscapeDataString(atom), HttpMethod.Get, null, null);
         fallback.Headers.Accept.Clear();
         fallback.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/octet-stream"));
-        using var headers = await SendAsync(fallback, session, cancellationToken).ConfigureAwait(false);
+        using var headers = await SendAsync(fallback, target.Session, cancellationToken).ConfigureAwait(false);
         return new AtomMetadata(headers.Content.Headers.ContentLength ?? -1, headers.Headers.ETag?.ToString(),
             headers.Content.Headers.LastModified);
     }
 
-    private async Task<byte[]> CopyAtomAsync(XboxSession session, GameTitle game, string atom, Stream destination,
+    private async Task<byte[]> CopyAtomAsync(CloudTarget target, GameTitle game, string atom, Stream destination,
         string? etag, IProgress<TransferProgress>? progress, CancellationToken cancellationToken)
     {
         _ = AtomId(atom);
-        using var request = CreateRequest(session, game, Uri.EscapeDataString(atom), HttpMethod.Get, null, etag);
+        using var request = CreateRequest(target, game, Uri.EscapeDataString(atom), HttpMethod.Get, null, etag);
         request.Headers.Accept.Clear();
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/octet-stream"));
-        using var response = await SendAsync(request, session, cancellationToken).ConfigureAwait(false);
+        using var response = await SendAsync(request, target.Session, cancellationToken).ConfigureAwait(false);
         if (etag is not null && response.Headers.ETag is { } actual && actual.ToString() != etag) throw Changed();
         using var idle = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         idle.CancelAfter(TimeSpan.FromSeconds(60));
@@ -311,7 +585,7 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
             {
                 idle.CancelAfter(TimeSpan.FromSeconds(60));
                 var count = await source.ReadAsync(buffer, idle.Token).ConfigureAwait(false);
-                CheckSession(session, cancellationToken);
+                CheckSession(target.Session, cancellationToken);
                 if (count == 0) break;
                 copied += count;
                 if (total is { } length && copied > length) throw InvalidResponse();
@@ -321,26 +595,26 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
             }
             if (total is { } expected && copied != expected)
                 throw new XboxServiceException("The cloud download ended before all file bytes arrived. Retry the download.");
-            CheckSession(session, cancellationToken);
+            CheckSession(target.Session, cancellationToken);
             return hash.GetHashAndReset();
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            CheckSession(session, cancellationToken);
+            CheckSession(target.Session, cancellationToken);
             throw new XboxServiceException("The cloud file transfer stalled. Check your connection and retry.");
         }
         catch (HttpRequestException)
         {
-            CheckSession(session, cancellationToken);
+            CheckSession(target.Session, cancellationToken);
             throw new XboxServiceException("The cloud download was interrupted. Check your connection and retry.");
         }
     }
 
-    private async Task<JsonDocument> RequestJsonAsync(XboxSession session, GameTitle game, string suffix,
+    private async Task<JsonDocument> RequestJsonAsync(CloudTarget target, GameTitle game, string suffix,
         HttpMethod method, string? body, string? etag, CancellationToken cancellationToken)
     {
-        using var request = CreateRequest(session, game, suffix, method, body, etag);
-        using var response = await SendAsync(request, session, cancellationToken).ConfigureAwait(false);
+        using var request = CreateRequest(target, game, suffix, method, body, etag);
+        using var response = await SendAsync(request, target.Session, cancellationToken).ConfigureAwait(false);
         if (response.Content.Headers.ContentLength is > MaximumJsonBytes) throw InvalidResponse();
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(30));
@@ -352,29 +626,29 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
             int count;
             while ((count = await source.ReadAsync(buffer, timeout.Token).ConfigureAwait(false)) != 0)
             {
-                CheckSession(session, cancellationToken);
+                CheckSession(target.Session, cancellationToken);
                 if (payload.Length + count > MaximumJsonBytes) throw InvalidResponse();
                 payload.Write(buffer, 0, count);
             }
-            CheckSession(session, cancellationToken);
+            CheckSession(target.Session, cancellationToken);
             return JsonDocument.Parse(payload.ToArray(), new JsonDocumentOptions { MaxDepth = 32 });
         }
         catch (JsonException) { throw InvalidResponse(); }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            CheckSession(session, cancellationToken);
+            CheckSession(target.Session, cancellationToken);
             throw new XboxServiceException("Xbox storage did not respond in time. Try again.");
         }
     }
 
-    private HttpRequestMessage CreateRequest(XboxSession session, GameTitle game, string suffix,
+    private HttpRequestMessage CreateRequest(CloudTarget target, GameTitle game, string suffix,
         HttpMethod method, string? body, string? etag)
     {
-        var root = "https://titlestorage.xboxlive.com/connectedstorage/users/xuid(" + session.Profile.Xuid +
+        var root = "https://titlestorage.xboxlive.com/connectedstorage/users/xuid(" + target.Xuid +
             ")/scids/" + Uri.EscapeDataString(game.ServiceConfigurationId!);
         var uri = new Uri(root + (suffix.StartsWith('?') || suffix.Length == 0 ? suffix : "/" + suffix));
         var request = new HttpRequestMessage(method, uri);
-        request.Headers.Authorization = new AuthenticationHeaderValue("XBL3.0", $"x={session.UserHash};{session.Token}");
+        request.Headers.Authorization = new AuthenticationHeaderValue("XBL3.0", $"x={target.Session.UserHash};{target.Session.Token}");
         request.Headers.Add("x-xbl-contract-version", "107");
         if (!string.IsNullOrWhiteSpace(game.PackageFamilyName)) request.Headers.Add("x-xbl-pfn", game.PackageFamilyName);
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
@@ -417,17 +691,17 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
         catch { response.Dispose(); throw; }
     }
 
-    private XboxSession GetSession(string xuid, GameTitle game, CancellationToken cancellationToken)
+    private CloudTarget GetSession(string xuid, GameTitle game, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         var session = authentication.CurrentSession ?? throw new XboxServiceException("Sign in before browsing cloud saves.");
         CheckSession(session, cancellationToken);
-        if (!ulong.TryParse(xuid, NumberStyles.None, CultureInfo.InvariantCulture, out var id) || id == 0 || xuid != session.Profile.Xuid)
-            throw new XboxServiceException("The selected profile does not match the authenticated Xbox account. Sign in again.");
+        if (!ulong.TryParse(xuid, NumberStyles.None, CultureInfo.InvariantCulture, out var id) || id == 0)
+            throw new XboxServiceException("Enter a valid numeric Xbox User ID (XUID).");
         if (!game.HasStorageIdentity || game.PackageFamilyName is { } pfn &&
             (pfn.Length > 256 || pfn.Any(char.IsControl)))
             throw new XboxServiceException("This title has no valid connected-storage identity. It may not support Xbox PC cloud saves.");
-        return session;
+        return new CloudTarget(id.ToString(CultureInfo.InvariantCulture), session);
     }
 
     private void CheckSession(XboxSession session, CancellationToken cancellationToken)
@@ -517,6 +791,12 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
         return result;
     }
 
+    private static string PackedSafeFolderName(string name)
+    {
+        var safe = string.Concat(name.Select(character => Path.GetInvalidFileNameChars().Contains(character) || character is '.' or ' ' ? '_' : character)).Trim();
+        return safe.Length == 0 ? "container" : safe.Length > 60 ? safe[..60] : safe;
+    }
+
     private static bool TryProperty(JsonElement element, string name, out JsonElement value)
     {
         if (element.ValueKind != JsonValueKind.Object) throw InvalidResponse();
@@ -535,6 +815,7 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
 
     private static string RequireString(JsonElement element, string name) => OptionalString(element, name) ?? throw InvalidResponse();
     private static XboxServiceException InvalidResponse() => new("Xbox storage returned malformed or unsupported save metadata. Refresh and try again.");
+    private static XboxServiceException MalformedPack() => new("The packed save file is damaged or incomplete. Download it again before extracting.");
     private static XboxServiceException Changed() => new("The cloud save changed since it was listed. Refresh the files before downloading.");
     private static XboxServiceException HttpFailure(HttpStatusCode status) => status switch
     {
@@ -548,8 +829,10 @@ public sealed class CloudSaveService(HttpClient httpClient, XboxAuthenticationSe
     };
 
     public void Dispose() { _signingKey.Dispose(); _writeGate.Dispose(); }
+    private sealed record CloudTarget(string Xuid, XboxSession Session);
     private sealed record BlobMetadata(string Path, string? DisplayName, string? ETag, DateTimeOffset? Modified);
     private sealed record ContainerSnapshot(BlobMetadata Metadata, Dictionary<string, string> Atoms);
     private sealed record AtomMetadata(long Size, string? ETag, DateTimeOffset? Modified = null);
+    private sealed record PackedEntry(string Path, string Atom, string Name);
 }
 

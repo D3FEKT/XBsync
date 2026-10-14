@@ -8,9 +8,9 @@ namespace XBsync.Services;
 
 public interface IXboxApiService
 {
-    Task<XboxProfile> GetProfileAsync(CancellationToken cancellationToken);
-    Task<IReadOnlyList<GameTitle>> GetPlayedGamesAsync(CancellationToken cancellationToken);
-    Task<GameTitle> ResolveStorageIdentityAsync(GameTitle game, CancellationToken cancellationToken);
+    Task<XboxProfile> GetProfileAsync(string xuid, CancellationToken cancellationToken);
+    Task<IReadOnlyList<GameTitle>> GetPlayedGamesAsync(string xuid, CancellationToken cancellationToken);
+    Task<GameTitle> ResolveStorageIdentityAsync(string xuid, GameTitle game, CancellationToken cancellationToken);
 }
 
 public sealed class XboxApiService(HttpClient httpClient, XboxAuthenticationService authentication) : IXboxApiService
@@ -19,14 +19,15 @@ public sealed class XboxApiService(HttpClient httpClient, XboxAuthenticationServ
     private const int MaximumPages = 50;
     private const int MaximumTitles = 10_000;
 
-    public async Task<XboxProfile> GetProfileAsync(CancellationToken cancellationToken)
+    public async Task<XboxProfile> GetProfileAsync(string xuid, CancellationToken cancellationToken)
     {
         var session = GetSession(cancellationToken);
-        var uri = new Uri($"https://profile.xboxlive.com/users/xuid({session.Profile.Xuid})/profile/settings?settings=Gamertag,GameDisplayPicRaw");
+        var target = RequireXuid(xuid);
+        var uri = new Uri($"https://profile.xboxlive.com/users/xuid({target})/profile/settings?settings=Gamertag,GameDisplayPicRaw");
         using var document = await GetJsonAsync(uri, session, cancellationToken).ConfigureAwait(false);
         var users = RequireArray(document.RootElement, "profileUsers");
-        if (users.GetArrayLength() != 1 || ReadIdentifier(users[0], "id") != session.Profile.Xuid)
-            throw new XboxServiceException("Xbox Live returned profile information for an unexpected account. Sign in again.");
+        if (users.GetArrayLength() != 1 || ReadIdentifier(users[0], "id") != target)
+            throw new XboxServiceException("Xbox Live returned profile information for a different account. Check the XUID and try again.");
 
         var settings = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var setting in RequireArray(users[0], "settings").EnumerateArray())
@@ -41,13 +42,14 @@ public sealed class XboxApiService(HttpClient httpClient, XboxAuthenticationServ
             throw InvalidResponse();
         settings.TryGetValue("GameDisplayPicRaw", out var picture);
         CheckSession(session, cancellationToken);
-        return new XboxProfile(session.Profile.Xuid, gamertag, ReadImageUri(picture));
+        return new XboxProfile(target, gamertag, ReadImageUri(picture));
     }
 
-    public async Task<IReadOnlyList<GameTitle>> GetPlayedGamesAsync(CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<GameTitle>> GetPlayedGamesAsync(string xuid, CancellationToken cancellationToken)
     {
         var session = GetSession(cancellationToken);
-        var firstPage = new Uri($"https://titlehub.xboxlive.com/users/xuid({session.Profile.Xuid})/titles/titlehistory/decoration/scid,image,detail?maxItems={MaximumTitles}");
+        var target = RequireXuid(xuid);
+        var firstPage = new Uri($"https://titlehub.xboxlive.com/users/xuid({target})/titles/titlehistory/decoration/scid,image,detail?maxItems={MaximumTitles}");
         Uri? nextPage = firstPage;
         var visited = new HashSet<string>(StringComparer.Ordinal);
         var titles = new List<GameTitle>();
@@ -67,7 +69,7 @@ public sealed class XboxApiService(HttpClient httpClient, XboxAuthenticationServ
                 using var document = await GetJsonAsync(nextPage, session, operation.Token).ConfigureAwait(false);
                 var root = document.RootElement;
                 var pageTitles = RequireArray(root, "titles");
-                ValidateResponseAccount(root, session);
+                ValidateResponseAccount(root, target);
 
                 foreach (var title in pageTitles.EnumerateArray())
                 {
@@ -105,10 +107,11 @@ public sealed class XboxApiService(HttpClient httpClient, XboxAuthenticationServ
         }
     }
 
-    public async Task<GameTitle> ResolveStorageIdentityAsync(GameTitle game, CancellationToken cancellationToken)
+    public async Task<GameTitle> ResolveStorageIdentityAsync(string xuid, GameTitle game, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(game);
         var session = GetSession(cancellationToken);
+        var target = RequireXuid(xuid);
         if (!uint.TryParse(game.TitleId, NumberStyles.None, CultureInfo.InvariantCulture, out var titleId) || titleId == 0)
             throw new XboxServiceException("The Xbox title identity is invalid. Refresh the game library.");
         game = game with
@@ -129,7 +132,7 @@ public sealed class XboxApiService(HttpClient httpClient, XboxAuthenticationServ
         foreach (var moniker in monikers)
         {
             CheckSession(session, cancellationToken);
-            var uri = new Uri($"https://titlehub.xboxlive.com/users/xuid({session.Profile.Xuid})/titles/{moniker}/decoration/scid,image,detail");
+            var uri = new Uri($"https://titlehub.xboxlive.com/users/xuid({target})/titles/{moniker}/decoration/scid,image,detail");
             JsonDocument document;
             try
             {
@@ -143,7 +146,7 @@ public sealed class XboxApiService(HttpClient httpClient, XboxAuthenticationServ
             using (document)
             {
                 var root = document.RootElement;
-                ValidateResponseAccount(root, session);
+                ValidateResponseAccount(root, target);
                 var returnedTitles = RequireArray(root, "titles");
                 if (returnedTitles.GetArrayLength() > MaximumTitles) throw InvalidResponse();
                 var candidates = new HashSet<(string? Scid, string? Pfn)>();
@@ -177,13 +180,20 @@ public sealed class XboxApiService(HttpClient httpClient, XboxAuthenticationServ
         return game;
     }
 
-    private static void ValidateResponseAccount(JsonElement root, XboxSession session)
+    private static void ValidateResponseAccount(JsonElement root, string xuid)
     {
         if (root.ValueKind != JsonValueKind.Object) throw InvalidResponse();
         foreach (var name in new[] { "xuid", "xboxUserId" })
             if (root.TryGetProperty(name, out var value) && value.ValueKind != JsonValueKind.Null &&
-                ReadIdentifier(root, name) != session.Profile.Xuid)
-                throw new XboxServiceException("Xbox Live returned game information for an unexpected account. Sign in again.");
+                ReadIdentifier(root, name) != xuid)
+                throw new XboxServiceException("Xbox Live returned game information for a different account. Check the XUID and try again.");
+    }
+
+    private static string RequireXuid(string xuid)
+    {
+        if (!ulong.TryParse(xuid, NumberStyles.None, CultureInfo.InvariantCulture, out var value) || value == 0)
+            throw new XboxServiceException("Enter a valid numeric Xbox User ID (XUID).");
+        return value.ToString(CultureInfo.InvariantCulture);
     }
 
     private static string ReadTitleId(JsonElement title)

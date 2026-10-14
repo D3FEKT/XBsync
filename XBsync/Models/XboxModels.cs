@@ -32,6 +32,11 @@ public sealed record CloudSaveFile(string ContainerId, string Id, string Name, l
 }
 
 public sealed record TransferProgress(long BytesTransferred, long? TotalBytes);
+public sealed record DownloadAllProgress(int ContainersListed, int ContainerCount, string ContainerName);
+public sealed record CloudSaveBatch(IReadOnlyList<CloudSaveFile> Files, IReadOnlyList<ContainerReadFailure> Failures);
+public sealed record ContainerReadFailure(string Container, string Error);
+public sealed record PackedDownloadResult(int FileCount, long TotalBytes);
+public sealed record PackedExtractResult(int FileCount, long TotalBytes);
 //public sealed record ReplacementResult(CloudSaveFile File, bool Verified)
 //{
     //public string? BackupPath { get; init; }

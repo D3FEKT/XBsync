@@ -16,6 +16,7 @@ public interface IDesktopUiService
     Task<AuthenticationResult> WithDeviceCodeDialogAsync(DeviceCodePrompt prompt, Func<CancellationToken, Task<AuthenticationResult>> authenticate, CancellationToken cancellationToken);
     void CopyText(string text);
     Task<string?> ChooseDownloadFolderAsync(CancellationToken cancellationToken);
+    Task InvokeAsync(Action action, CancellationToken cancellationToken = default);
     //Task<string?> ChooseReplacementFileAsync(CancellationToken cancellationToken);
     //Task<bool> ConfirmReplacementAsync(string name, CancellationToken cancellationToken);
     Task OpenDownloadFolderAsync();
@@ -76,6 +77,12 @@ public class DesktopUiService : IDesktopUiService
         data.SetText(text);
         Clipboard.SetContent(data);
         Clipboard.Flush();
+    }
+
+    public Task InvokeAsync(Action action, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(action);
+        return OnUiAsync(() => { action(); return Task.FromResult(true); }, cancellationToken);
     }
 
     public Task<string?> ChooseDownloadFolderAsync(CancellationToken cancellationToken) => WithModalAsync<string?>(async token =>

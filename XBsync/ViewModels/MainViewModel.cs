@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.Globalization;
 using System.Reflection;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -36,8 +37,11 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
     private int _accountGeneration;
     private int _saveGeneration;
     private int _transferProgressGeneration;
+    private const int DownloadConcurrency = 8;
     private bool _updatingContainers;
     private bool _initialized;
+    private string? _loadedXuid;
+    private string? _signedInXuid;
 
     public RangeObservableCollection<GameTitle> Games { get; } = [];
     public RangeObservableCollection<CloudSaveContainer> Containers { get; } = [];
@@ -53,11 +57,12 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
 
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(Gamertag), nameof(Xuid), nameof(AvatarUri), nameof(ConnectionText), nameof(AuthenticationVisibility))]
-    [NotifyCanExecuteChangedFor(nameof(CopyXuidCommand), nameof(DisconnectCommand), nameof(RefreshSavesCommand), nameof(DownloadSelectedCommand))]
+    [NotifyCanExecuteChangedFor(nameof(CopyXuidCommand), nameof(DisconnectCommand), nameof(RefreshSavesCommand), nameof(DownloadSelectedCommand), nameof(DownloadPackedCommand))]
     public partial XboxProfile? Profile { get; set; }
 
     [ObservableProperty]
-    [NotifyCanExecuteChangedFor(nameof(SignInCommand), nameof(RetrySilentSignInCommand), nameof(RefreshCommand), nameof(RefreshSavesCommand), nameof(DownloadSelectedCommand))]
+    [NotifyCanExecuteChangedFor(nameof(SignInCommand), nameof(RetrySilentSignInCommand), nameof(RefreshCommand), nameof(RefreshSavesCommand), nameof(DownloadSelectedCommand),
+        nameof(LoadXuidCommand), nameof(UseMyAccountCommand), nameof(DownloadPackedCommand))]
     public partial bool IsBusy { get; set; }
 
     [ObservableProperty]
@@ -65,13 +70,17 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
     public partial bool IsLoadingGames { get; set; }
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(CanSelectFiles))]
-    [NotifyCanExecuteChangedFor(nameof(DownloadSelectedCommand))]
+    [NotifyCanExecuteChangedFor(nameof(DownloadSelectedCommand), nameof(DownloadPackedCommand))]
     public partial bool IsLoadingFiles { get; set; }
     [ObservableProperty] public partial string StatusMessage { get; set; } = "Checking local Xbox sign-in…";
     [ObservableProperty] public partial string ErrorMessage { get; set; } = "";
     [ObservableProperty] public partial bool HasError { get; set; }
     [ObservableProperty] public partial string LastCheckText { get; set; } = "No successful check yet";
     [ObservableProperty] public partial string SearchText { get; set; } = "";
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(IsBrowsingAnotherAccount), nameof(XuidSourceText))]
+    [NotifyCanExecuteChangedFor(nameof(LoadXuidCommand), nameof(UseMyAccountCommand))]
+    public partial string TargetXuid { get; set; } = "";
     [ObservableProperty] public partial int FilterIndex { get; set; }
     [ObservableProperty] public partial int SortIndex { get; set; }
     [ObservableProperty]
@@ -79,6 +88,7 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
     public partial bool IsGridView { get; set; }
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(GameDetailsVisibility), nameof(NoGameVisibility))]
+    [NotifyCanExecuteChangedFor(nameof(DownloadPackedCommand), nameof(RefreshSavesCommand), nameof(DownloadSelectedCommand))]
     public partial GameTitle? SelectedGame { get; set; }
     [ObservableProperty] public partial CloudSaveContainer? SelectedContainer { get; set; }
     [ObservableProperty] public partial CloudSaveFile? FocusedFile { get; set; }
@@ -88,7 +98,7 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
     public partial int SelectedFileCount { get; set; }
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(TransferVisibility), nameof(CanSelectFiles))]
-    [NotifyCanExecuteChangedFor(nameof(DownloadSelectedCommand), nameof(CancelTransferCommand), nameof(RefreshSavesCommand), nameof(RefreshCommand))]
+    [NotifyCanExecuteChangedFor(nameof(DownloadSelectedCommand), nameof(CancelTransferCommand), nameof(RefreshSavesCommand), nameof(RefreshCommand), nameof(DownloadPackedCommand))]
     public partial bool IsTransferring { get; set; }
     [ObservableProperty] public partial string TransferText { get; set; } = "";
     [ObservableProperty] public partial double TransferPercent { get; set; }
@@ -98,6 +108,11 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
 
     public string Gamertag => Profile?.Gamertag ?? "Not connected";
     public string Xuid => Profile?.Xuid ?? "—";
+    public bool IsBrowsingAnotherAccount => _loadedXuid is not null && _loadedXuid != _signedInXuid;
+    public string XuidSourceText => IsBrowsingAnotherAccount
+        ? "Browsing XUID " + _loadedXuid + " using the signed-in Xbox connection."
+        : "Browsing the signed-in Xbox account.";
+    private string? EffectiveXuid => _loadedXuid ?? _signedInXuid;
     public Uri? AvatarUri => Profile?.AvatarUri;
     public string ConnectionText => Profile is null ? "Disconnected" : "Xbox connected";
     public Visibility AuthenticationVisibility => Visible(Profile is null);
@@ -110,6 +125,7 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
     public Visibility GameDetailsVisibility => Visible(SelectedGame is not null);
     public Visibility NoGameVisibility => Visible(SelectedGame is null);
     public Visibility TransferVisibility => Visible(IsTransferring);
+    public Visibility XuidNoticeVisibility => Visible(IsBrowsingAnotherAccount);
     public bool CanSelectFiles => !IsLoadingFiles && !IsTransferring;
     public string SelectionText => SelectedFileCount == 0 ? "Select one or more files to download."
         : $"{SelectedFileCount} file{(SelectedFileCount == 1 ? "" : "s")} selected";
@@ -140,6 +156,9 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         ClearError();
         ClearLibrary();
         Profile = null;
+        _signedInXuid = null;
+        _loadedXuid = null;
+        NotifyTargetState();
         StatusMessage = interactive ? "Waiting for Microsoft sign-in…" : "Checking local Xbox sign-in…";
         try
         {
@@ -147,6 +166,8 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
             if (generation != _accountGeneration || token.IsCancellationRequested) return;
             StatusMessage = result.Message;
             Profile = result.Profile;
+            _signedInXuid = result.Profile?.Xuid;
+            TargetXuid = _signedInXuid ?? "";
             if (!result.IsSuccess)
             {
                 if (result.Status is AuthenticationStatus.AccountMismatch or AuthenticationStatus.ServiceFailure) SetError(result.Message);
@@ -186,8 +207,8 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         try
         {
             await LoadLibraryAsync(generation, token);
-            if (generation == _accountGeneration && !token.IsCancellationRequested && SelectedGame is { } game && Profile is { } user)
-                await LoadContainersAsync(game, user.Xuid, generation, SelectedContainer?.Id, _selectedFiles.Select(file => file.Id).ToArray());
+            if (generation == _accountGeneration && !token.IsCancellationRequested && SelectedGame is { } game && EffectiveXuid is { } xuid)
+                await LoadContainersAsync(game, xuid, generation, SelectedContainer?.Id, _selectedFiles.Select(file => file.Id).ToArray());
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception exception) { if (generation == _accountGeneration && !token.IsCancellationRequested) ReportServiceError(exception, "Could not refresh your games. Try again."); }
@@ -195,13 +216,73 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
     }
     private bool CanRefresh() => !IsBusy && !IsTransferring;
 
+    [RelayCommand(CanExecute = nameof(CanLoadXuid))]
+    private async Task LoadXuidAsync()
+    {
+        if (authentication.CurrentProfile is null) { await AuthenticateAsync(false); return; }
+        string target;
+        try { target = RequireXuid(TargetXuid); }
+        catch (Exception exception) { SetError(exception.Message); return; }
+        await SwitchTargetAsync(target, "Browsing XUID " + target + ".");
+    }
+    private bool CanLoadXuid() => !IsBusy && !IsTransferring && _signedInXuid is not null;
+
+    [RelayCommand(CanExecute = nameof(CanUseMyAccount))]
+    private Task UseMyAccountAsync() => SwitchTargetAsync(_signedInXuid, "Returning to the signed-in Xbox account.");
+    private bool CanUseMyAccount() => !IsBusy && !IsTransferring && _signedInXuid is not null && IsBrowsingAnotherAccount;
+
+    private async Task SwitchTargetAsync(string? xuid, string activity)
+    {
+        _loadedXuid = xuid;
+        TargetXuid = xuid ?? "";
+        NotifyTargetState();
+        IsBusy = true;
+        ClearError();
+        ClearLibrary();
+        var generation = ++_accountGeneration;
+        _accountRequest?.Cancel();
+        _accountRequest?.Dispose();
+        _accountRequest = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        var token = _accountRequest.Token;
+        StatusMessage = activity;
+        AddActivity(activity);
+        try { await LoadLibraryAsync(generation, token); }
+        catch (OperationCanceledException) when (generation != _accountGeneration || token.IsCancellationRequested) { }
+        catch (Exception exception)
+        {
+            if (generation == _accountGeneration)
+            {
+                ReportServiceError(exception, "Could not load games and saves for that account. Check the XUID and your connection, then retry.");
+                StatusMessage = ErrorMessage;
+            }
+        }
+        finally { if (generation == _accountGeneration) IsBusy = false; }
+    }
+
+    private void NotifyTargetState()
+    {
+        OnPropertyChanged(nameof(IsBrowsingAnotherAccount));
+        OnPropertyChanged(nameof(XuidSourceText));
+        OnPropertyChanged(nameof(XuidNoticeVisibility));
+        LoadXuidCommand.NotifyCanExecuteChanged();
+        UseMyAccountCommand.NotifyCanExecuteChanged();
+    }
+
+    private static string RequireXuid(string xuid)
+    {
+        if (!ulong.TryParse(xuid?.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out var value) || value == 0)
+            throw new XboxServiceException("Enter a valid numeric Xbox User ID (XUID).");
+        return value.ToString(CultureInfo.InvariantCulture);
+    }
+
     private async Task LoadLibraryAsync(int generation, CancellationToken token)
     {
         IsLoadingGames = true;
         try
         {
-            var profileTask = api.GetProfileAsync(token);
-            var gamesTask = api.GetPlayedGamesAsync(token);
+            if (EffectiveXuid is not { } target) return;
+            var profileTask = api.GetProfileAsync(target, token);
+            var gamesTask = api.GetPlayedGamesAsync(target, token);
             try { await Task.WhenAll(profileTask, gamesTask); }
             finally
             {
@@ -230,6 +311,9 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         _accountRequest?.Cancel();
         authentication.SignOut();
         Profile = null;
+        _signedInXuid = null;
+        _loadedXuid = null;
+        NotifyTargetState();
         IsBusy = false;
         IsLoadingGames = false;
         ClearLibrary();
@@ -282,15 +366,15 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         ShowCompactDetails = false;
         FileStateMessage = value is null ? "Choose a game to view its cloud save files." : "Loading save containers...";
         RefreshSavesCommand.NotifyCanExecuteChanged();
-        if (value is not null && Profile is not null) _ = LoadContainersAsync(value, Profile.Xuid, _accountGeneration);
+        if (value is not null && EffectiveXuid is { } xuid) _ = LoadContainersAsync(value, xuid, _accountGeneration);
     }
 
     [RelayCommand(CanExecute = nameof(CanRefreshSaves))]
     private Task RefreshSavesAsync()
     {
-        if (!CanRefreshSaves() || SelectedGame is not { } game || Profile is not { } user) return Task.CompletedTask;
+        if (!CanRefreshSaves() || SelectedGame is not { } game || EffectiveXuid is not { } xuid) return Task.CompletedTask;
         ClearError();
-        return LoadContainersAsync(game, user.Xuid, _accountGeneration, SelectedContainer?.Id, _selectedFiles.Select(file => file.Id).ToArray());
+        return LoadContainersAsync(game, xuid, _accountGeneration, SelectedContainer?.Id, _selectedFiles.Select(file => file.Id).ToArray());
     }
     private bool CanRefreshSaves() => !IsBusy && !IsTransferring && Profile is not null && SelectedGame is not null;
 
@@ -315,7 +399,7 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
             if (!game.HasStorageIdentity && _resolvedStorageIdentity is null)
             {
                 FileStateMessage = "Resolving the selected game's connected-storage identity...";
-                storageGame = await api.ResolveStorageIdentityAsync(game, token);
+                storageGame = await api.ResolveStorageIdentityAsync(xuid, game, token);
                 if (!Matches(game, xuid, generation, token) || _gameRequest != request) return;
                 if (storageGame.HasStorageIdentity) _resolvedStorageIdentity = storageGame;
             }
@@ -367,8 +451,8 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         _fileRequest = null;
         ClearFiles();
         FileStateMessage = value is null ? "Choose a save container." : "Loading save files...";
-        if (!_updatingContainers && value is not null && SelectedGame is { } game && Profile is { } user)
-            _ = LoadFilesAsync(game, value, user.Xuid, _accountGeneration);
+        if (!_updatingContainers && value is not null && SelectedGame is { } game && EffectiveXuid is { } xuid)
+            _ = LoadFilesAsync(game, value, xuid, _accountGeneration);
     }
 
     private async Task LoadFilesAsync(GameTitle game, CloudSaveContainer container, string xuid, int generation,
@@ -408,7 +492,7 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
     }
 
     private bool Matches(GameTitle game, string xuid, int generation, CancellationToken token) =>
-        !token.IsCancellationRequested && generation == _accountGeneration && SelectedGame == game && Profile?.Xuid == xuid;
+        !token.IsCancellationRequested && generation == _accountGeneration && SelectedGame == game && EffectiveXuid == xuid;
 
     public void SetSelectedFiles(IEnumerable<CloudSaveFile> files)
     {
@@ -422,10 +506,138 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         SelectedContainer is not null && _selectedFiles.Count > 0 && _selectedFiles.All(file => Files.Contains(file) && file.ContainerId == SelectedContainer.Id);
     //private bool CanReplace() => CanDownload() && _selectedFiles.Count == 1;
 
+    private bool CanDownloadAll() => !IsBusy && !IsLoadingFiles && !IsTransferring && Profile is not null && SelectedGame is not null;
+
+    [RelayCommand(CanExecute = nameof(CanDownloadAll))]
+    private async Task DownloadPackedAsync()
+    {
+        if (!CanDownloadAll() || EffectiveXuid is not { } xuid || SelectedGame is not { } game) return;
+        var generation = _accountGeneration;
+        var selection = _saveGeneration;
+        using var request = BeginTransfer("Choose a download folder.");
+        var token = request.Token;
+        string? folder = null;
+        string? pack = null;
+        var extracted = 0;
+        try
+        {
+            folder = await desktop.ChooseDownloadFolderAsync(token);
+            if (!Matches(game, xuid, generation, token) || selection != _saveGeneration) return;
+            if (folder is null) { TransferText = "Download cancelled before any files were written."; return; }
+            folder = Path.GetFullPath(folder);
+            var storageGame = await ResolveStorageGameAsync(game, xuid, generation, token);
+            if (storageGame is null) return;
+            var list = await cloud.GetContainersAsync(xuid, storageGame, token);
+            if (!TransferMatches(game, xuid, generation, selection, token)) return;
+            var ordered = list.OrderBy(container => container.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+            if (ordered.Length == 0)
+            {
+                TransferText = StatusMessage = "No cloud saves were returned for this game.";
+                return;
+            }
+            pack = Path.Combine(folder, $".xbsync-{Guid.NewGuid():N}.xbs");
+            var result = await DownloadPackedToFileAsync(xuid, storageGame, ordered, pack, request, game, generation, selection, token);
+            if (!TransferMatches(game, xuid, generation, selection, token)) return;
+            if (result.FileCount == 0)
+            {
+                StatusMessage = $"No save files were returned for this game. Nothing was written to {folder}.";
+                TransferText = StatusMessage;
+                TransferPercent = 100;
+                AddActivity(StatusMessage);
+                return;
+            }
+            TransferText = $"Extracting {result.FileCount} file{(result.FileCount == 1 ? "" : "s")} to {folder}...";
+            await using (var packed = new FileStream(pack, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, true))
+                (extracted, _) = await cloud.ExtractPackedAsync(packed, folder, token);
+            if (!TransferMatches(game, xuid, generation, selection, token)) return;
+            TransferPercent = 100;
+            StatusMessage = $"Downloaded and extracted {extracted} file{(extracted == 1 ? "" : "s")} to {folder}.";
+            TransferText = StatusMessage;
+            AddActivity(StatusMessage);
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            if (TransferMatches(game, xuid, generation, selection, token))
+            {
+                TransferText = StatusMessage = $"Download cancelled. {extracted} file{(extracted == 1 ? "" : "s")} extracted{(folder is null ? "" : $" to {folder}")}; extracted files are kept.";
+                AddActivity(StatusMessage);
+            }
+        }
+        catch (Exception exception)
+        {
+            if (TransferMatches(game, xuid, generation, selection, token))
+            {
+                var fallback = $"Could not finish packing this game's saves. {extracted} file{(extracted == 1 ? "" : "s")} extracted and kept{(folder is null ? "" : $" in {folder}")}. Check your connection, available disk space, and folder permissions, then retry.";
+                ReportTransferError(exception, fallback);
+                TransferText = ErrorMessage;
+                AddActivity(ErrorMessage);
+            }
+        }
+        finally
+        {
+            if (pack is not null)
+            {
+                try { File.Delete(pack); }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException) { }
+            }
+            EndTransfer(request, selection);
+        }
+    }
+
+    private async Task<PackedDownloadResult> DownloadPackedToFileAsync(string xuid, GameTitle game,
+        IReadOnlyList<CloudSaveContainer> containers, string path, CancellationTokenSource request, GameTitle selected,
+        int generation, int selection, CancellationToken token)
+    {
+        await using var packed = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 81920, true);
+        var progress = new Progress<TransferProgress>(value =>
+        {
+            if (request.IsCancellationRequested || !TransferMatches(selected, xuid, generation, selection, token)) return;
+            var total = value.TotalBytes is >= 0 ? value.TotalBytes.Value : 0;
+            IsTransferIndeterminate = true;
+            TransferPercent = 0;
+            TransferText = total > 0
+                ? $"Downloading save - {Math.Max(0, value.BytesTransferred):N0} / {total:N0} bytes"
+                : $"Downloading save - {Math.Max(0, value.BytesTransferred):N0} bytes";
+        });
+        var result = await cloud.DownloadPackedAsync(xuid, game, containers, packed, DownloadConcurrency, progress, token);
+        token.ThrowIfCancellationRequested();
+        await packed.FlushAsync(token);
+        await Task.Run(() => packed.Flush(true), token);
+        return result;
+    }
+
+    private async Task<GameTitle?> ResolveStorageGameAsync(GameTitle game, string xuid, int generation, CancellationToken token)
+    {
+        var storageGame = _resolvedStorageIdentity ?? game;
+        if (!game.HasStorageIdentity && _resolvedStorageIdentity is null)
+        {
+            TransferText = "Resolving the selected game's connected-storage identity...";
+            storageGame = await api.ResolveStorageIdentityAsync(xuid, game, token);
+            if (!Matches(game, xuid, generation, token)) return null;
+            if (storageGame.HasStorageIdentity) _resolvedStorageIdentity = storageGame;
+        }
+        if (storageGame.HasStorageIdentity) return storageGame;
+        SetError("Xbox Live did not return a valid connected-storage identity for this game. This title may not support Xbox PC cloud saves. Use Refresh saves to retry.");
+        TransferText = ErrorMessage;
+        return null;
+    }
+
+    private bool TransferMatches(GameTitle game, string xuid, int generation, int selection, CancellationToken token) =>
+        !token.IsCancellationRequested && generation == _accountGeneration && selection == _saveGeneration && SelectedGame == game && EffectiveXuid == xuid;
+
+    private static string SafeFolderName(string name)
+    {
+        var safe = string.Concat(name.Select(character => Path.GetInvalidFileNameChars().Contains(character) || character is '.' or ' ' ? '_' : character)).Trim();
+        return safe.Length == 0 ? "container" : safe.Length > 60 ? safe[..60] : safe;
+    }
+
+    private static string DescribeError(Exception exception) => exception is XboxServiceException service ? service.Message
+        : exception is OperationCanceledException ? "The request timed out." : exception.Message;
+
     [RelayCommand(CanExecute = nameof(CanDownload))]
     private async Task DownloadSelectedAsync()
     {
-        if (!CanDownload() || Profile is not { } user || SelectedGame is not { } game || SelectedContainer is not { } container) return;
+        if (!CanDownload() || EffectiveXuid is not { } xuid || SelectedGame is not { } game || SelectedContainer is not { } container) return;
         var storageGame = _resolvedStorageIdentity ?? game;
         var files = _selectedFiles.ToArray();
         var generation = _accountGeneration;
@@ -438,20 +650,22 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         try
         {
             folder = await desktop.ChooseDownloadFolderAsync(token);
-            if (!Matches(game, user.Xuid, generation, token) || selection != _saveGeneration) return;
+            if (!Matches(game, xuid, generation, token) || selection != _saveGeneration) return;
             if (folder is null) { TransferText = "Download cancelled before any files were written."; return; }
             folder = Path.GetFullPath(folder);
+            folder = Path.Combine(folder, SafeFolderName(container.Name));
+            Directory.CreateDirectory(folder);
             for (var index = 0; index < files.Length; index++)
             {
                 token.ThrowIfCancellationRequested();
                 currentFile = files[index];
                 TransferText = $"Downloading {index + 1}/{files.Length}: {currentFile.Name}";
-                var progress = CreateTransferProgress(request, game, container, user.Xuid, generation, selection,
+                var progress = CreateTransferProgress(request, game, container, xuid, generation, selection,
                     "Downloading", currentFile, index, files.Length, currentFile.Size);
-                var destination = await DownloadFileAsync(user.Xuid, storageGame, currentFile, folder, progress, token);
+                var destination = await DownloadFileAsync(xuid, storageGame, currentFile, folder, progress, token);
                 completed++;
                 ++_transferProgressGeneration;
-                if (!TransferContextMatches(game, container, user.Xuid, generation, selection)) return;
+                if (!TransferContextMatches(game, container, xuid, generation, selection)) return;
                 TransferPercent = completed * 100d / files.Length;
                 AddActivity($"Downloaded {currentFile.Name} to {destination}.");
             }
@@ -461,7 +675,7 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested)
         {
-            if (TransferContextMatches(game, container, user.Xuid, generation, selection))
+            if (TransferContextMatches(game, container, xuid, generation, selection))
             {
                 TransferText = StatusMessage = $"Download cancelled. {completed} of {files.Length} files completed{(completed > 0 ? $" in {folder}" : "")}; completed files are kept.";
                 AddActivity(StatusMessage);
@@ -469,7 +683,7 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
         }
         catch (Exception exception)
         {
-            if (TransferContextMatches(game, container, user.Xuid, generation, selection))
+            if (TransferContextMatches(game, container, xuid, generation, selection))
             {
                 var fallback = $"Could not download {currentFile.Name}. {completed} of {files.Length} files completed and are kept. Check your connection, available disk space, and folder permissions, then retry the remaining files.";
                 ReportTransferError(exception, fallback);
@@ -586,10 +800,11 @@ public sealed partial class MainViewModel(IXboxAuthenticationService authenticat
     }
     private bool CanCancelTransfer() => IsTransferring && _transferRequest is { IsCancellationRequested: false };
 
-    private bool TransferContextMatches(GameTitle game, CloudSaveContainer container, string xuid, int generation, int selection) =>
-        generation == _accountGeneration && selection == _saveGeneration && SelectedGame == game && SelectedContainer == container && Profile?.Xuid == xuid;
+    private bool TransferContextMatches(GameTitle game, CloudSaveContainer? container, string xuid, int generation, int selection) =>
+        generation == _accountGeneration && selection == _saveGeneration && SelectedGame == game && EffectiveXuid == xuid &&
+        (container is null || SelectedContainer == container);
 
-    private IProgress<TransferProgress> CreateTransferProgress(CancellationTokenSource request, GameTitle game, CloudSaveContainer container,
+    private IProgress<TransferProgress> CreateTransferProgress(CancellationTokenSource request, GameTitle game, CloudSaveContainer? container,
         string xuid, int generation, int selection, string action, CloudSaveFile file, int index, int count, long fallbackTotal)
     {
         var phase = ++_transferProgressGeneration;

@@ -23,7 +23,7 @@ internal sealed class XboxSession(string token, string userHash, XboxProfile pro
 {
     internal string Token { get; } = token;
     internal string UserHash { get; } = userHash;
-    internal XboxProfile Profile { get; } = profile;
+    internal XboxProfile Profile { get; set; } = profile;
     internal DateTimeOffset ExpiresAt { get; } = expiresAt;
     public override string ToString() => nameof(XboxSession);
 }

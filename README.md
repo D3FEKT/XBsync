@@ -4,7 +4,7 @@
   <img src="docs/icon.png" width="96" alt="XBsync app icon" />
 </p>
 
-**Version 1.0.0**
+**Version 1.0.1**
 
 XBsync is a small Windows app for downloading Xbox cloud saves. It lists what Xbox is holding for a game, downloads the files you want, and saves them to a folder you pick. It's written in C# on .NET 10 with a WinUI 3 interface.
 
@@ -16,12 +16,13 @@ It talks to Xbox's connected-storage service directly and reuses the Xbox sign-i
 - Shows your profile, avatar, XUID, and played games, with search, filtering, sorting, and list or grid layouts.
 - Lists the save containers and files Xbox holds for a title.
 - Downloads the files you pick to a folder you choose, with progress, cancel, and safe names when a file already exists.
+- **Download all** pulls every save container for a game in one go, then extracts the folders and files into the folder you pick.
 
 ## Downloading
 
 1. Open XBsync and let it try to sign in. Click **Sign in** if it needs a hand.
 2. Pick a game, then one of its save containers.
-3. Choose the files you want and click **Download Selected**. **Open Download Folder** jumps to the last folder you used.
+3. Choose the files you want and click **Download Selected**, or click **Download all** to pull the whole game at once. It unpacks into its original folders and file names. **Open Download Folder** jumps to the last folder you used.
 
 ## Things worth knowing
 
@@ -30,6 +31,8 @@ Xbox can refuse a read while you're browsing or downloading, and there is no way
 Your session isn't renewed in the background, so you'll sign in again once it expires.
 
 ## Limitations
+
+Swapping XUID's is limited, only works on specific games, generally most from xbox one era.
 
 Not every save can be reached. Some titles appear to protect their save data with extra checks, and Xbox won't hand it over even though the account and container look fine. When that happens there is nothing XBsync can do about it, so those saves simply aren't accessible.
 

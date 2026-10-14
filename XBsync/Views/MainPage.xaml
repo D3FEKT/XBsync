@@ -95,11 +95,16 @@
                         <TextBlock Text="{x:Bind ViewModel.Gamertag, Mode=OneWay}" FontWeight="SemiBold" MaxWidth="260" TextTrimming="CharacterEllipsis" />
                         <StackPanel Orientation="Horizontal" Spacing="7">
                             <TextBlock Text="XUID" Foreground="{ThemeResource TextFillColorSecondaryBrush}" VerticalAlignment="Center" FontSize="12" />
-                            <TextBlock Text="{x:Bind ViewModel.Xuid, Mode=OneWay}" IsTextSelectionEnabled="True" FontFamily="Cascadia Mono" FontSize="14" VerticalAlignment="Center" />
+                            <TextBox Width="176" Text="{x:Bind ViewModel.TargetXuid, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                                     PlaceholderText="Enter any XUID" InputScope="Number" FontFamily="Cascadia Mono" FontSize="13"
+                                     VerticalAlignment="Center" AutomationProperties.Name="Xbox User ID to browse" />
+                            <Button Content="Load" Command="{x:Bind ViewModel.LoadXuidCommand}" VerticalAlignment="Center" />
                             <Button Command="{x:Bind ViewModel.CopyXuidCommand}" Padding="5" ToolTipService.ToolTip="Copy XUID" AutomationProperties.Name="Copy XUID">
                                 <FontIcon Glyph="&#xE8C8;" FontSize="14" />
                             </Button>
                         </StackPanel>
+                        <TextBlock Text="{x:Bind ViewModel.XuidSourceText, Mode=OneWay}" Visibility="{x:Bind ViewModel.XuidNoticeVisibility, Mode=OneWay}"
+                                   FontSize="12" Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextTrimming="CharacterEllipsis" MaxWidth="320" />
                     </StackPanel>
                 </Grid>
             </Grid>
@@ -217,7 +222,10 @@
                                             </ComboBox.ItemTemplate>
                                         </ComboBox>
                                         <StackPanel Grid.Row="2" Spacing="8">
-                                            <Button Content="Download Selected" Command="{x:Bind ViewModel.DownloadSelectedCommand}" ToolTipService.ToolTip="Select one or more files" />
+                                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                                <Button Content="Download Selected" Command="{x:Bind ViewModel.DownloadSelectedCommand}" ToolTipService.ToolTip="Select one or more files" />
+                                                <Button Content="Download all" Command="{x:Bind ViewModel.DownloadPackedCommand}" ToolTipService.ToolTip="Download this game's whole save, then extract every folder and file into your chosen folder" AutomationProperties.Name="Download all saves" />
+                                            </StackPanel>
                                             <StackPanel Orientation="Horizontal" Spacing="8">
                                                 <Button Content="Refresh saves" Command="{x:Bind ViewModel.RefreshSavesCommand}" />
                                                 <Button Content="Open Download Folder" Command="{x:Bind ViewModel.OpenDownloadFolderCommand}" />
@@ -287,6 +295,12 @@
                         <TextBlock Text="XUID" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                         <TextBlock Text="{x:Bind ViewModel.Xuid, Mode=OneWay}" FontSize="26" FontFamily="Cascadia Mono" IsTextSelectionEnabled="True" />
                         <StackPanel Orientation="Horizontal" Spacing="12"><Button Content="Copy XUID" Command="{x:Bind ViewModel.CopyXuidCommand}" /><Button Content="Disconnect" Command="{x:Bind ViewModel.DisconnectCommand}" /></StackPanel>
+                        <Border Style="{StaticResource CardStyle}" Visibility="{x:Bind ViewModel.XuidNoticeVisibility, Mode=OneWay}" Padding="14">
+                            <StackPanel Spacing="10">
+                                <TextBlock Text="{x:Bind ViewModel.XuidSourceText, Mode=OneWay}" TextWrapping="Wrap" />
+                                <Button Content="Use my account" Command="{x:Bind ViewModel.UseMyAccountCommand}" HorizontalAlignment="Left" />
+                            </StackPanel>
+                        </Border>
                         <TextBlock Text="Local Xbox credential reuse is best effort. Use Sign in to explicitly choose an account when local identity is ambiguous." Foreground="{ThemeResource TextFillColorSecondaryBrush}" TextWrapping="Wrap" />
                     </StackPanel>
                 </ScrollViewer>
@@ -310,7 +324,7 @@
                         <Border Style="{StaticResource CardStyle}">
                             <StackPanel Spacing="12">
                                 <TextBlock Text="About" FontSize="18" FontWeight="SemiBold" />
-                                <TextBlock x:Name="VersionText" Text="Version 1.0.0" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                                <TextBlock x:Name="VersionText" Text="Version 1.0.1" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                 <StackPanel Orientation="Horizontal" Spacing="2" VerticalAlignment="Center">
                                     <TextBlock Text="Created by" VerticalAlignment="Center" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
                                     <HyperlinkButton Content="D3FEKT" NavigateUri="https://github.com/D3FEKT" Padding="4,0" AutomationProperties.Name="D3FEKT on GitHub" />
